@@ -6,7 +6,17 @@ WOK Ground Control — WebSocket ↔ UDP Bridge
 Bridges browser WebSocket clients to cFS CI_LAB (cmd) and TO_LAB (tlm) UDP ports.
 
 Usage:
-    python3 wok_bridge.py [--cfs-host 127.0.0.1] [--cmd-port 1234] [--tlm-port 2234] [--ws-port 8765]
+    python3 wok_bridge.py [--cfs-host 127.0.0.1] [--cmd-port 1234] [--tlm-port 2234]
+                          [--ws-port 8765] [--ws-host 127.0.0.1]
+
+Requires Python 3.10+ and the 'websockets' package (see ground/requirements.txt).
+
+SECURITY: there is NO authentication on the WebSocket. Any client that can
+reach it can command the flight software. The server therefore listens on
+127.0.0.1 only by default; passing --ws-host 0.0.0.0 (so a dashboard on
+another machine can connect) is an explicit opt-in that must only be used
+on a trusted LAN. The telemetry UDP socket is bound to the address TO_LAB
+is told to send to (127.0.0.1 for a local cFS), never to all interfaces.
 """
 
 import argparse
@@ -27,9 +37,11 @@ except ImportError:
 
 
 # ─── cFS / CCSDS Constants ─────────────────────────────────────────────
-# Draco CCSDS v1 with extended headers (priext mode)
-# CMD: 8 bytes header (6 primary + 2 secondary: FC + checksum)
-# TLM: 16 bytes header (6 primary + 2 extended + 8 secondary)
+# Draco CCSDS v1 primary headers (default cFS v7.0.0 build, no extended
+# header). All app payloads are little-endian, 4-byte aligned, and start
+# right after the header:
+# CMD: 8-byte header  (6 primary + 2 secondary: function code + checksum)
+# TLM: 16-byte header (6 primary + 6 time secondary + 4 alignment padding)
 
 class WokMid:
     """WOK Message IDs — must match wok_msgids.h"""
@@ -60,6 +72,7 @@ class WokMid:
     HK_TLM        = 0x08D9
     DRILL_TLM     = 0x08DA
     DRILL_STATUS_TLM = 0x08DB
+    SEIS_FILECHUNK = 0x08DC
 
     # TO_LAB
     TO_LAB_CMD    = 0x1880
@@ -118,11 +131,14 @@ def local_ip_toward(host):
 
 TLM_DECODERS = {}
 
+# WOK_HAL_SrcState_t — EM source state, shared by SEIS HK and STATUS
+SOURCE_STATES = ["IDLE", "CHARGING", "ARMED", "FIRED", "SWEEPING"]
+
 def decode_tlm_header(data):
     """Decode CCSDS primary header, return (mid, seq_count, length, payload_offset)."""
     if len(data) < 16:
         return None
-    stream_id, sequence, length = struct.unpack(">HHH", data[0:6])
+    stream_id, sequence, length = struct.unpack_from(">HHH", data, 0)
     mid = stream_id  # full MID including the 0x0800 telemetry bit
     seq_count = sequence & 0x3FFF
     # Payload starts at byte 16 (after full TLM header)
@@ -131,10 +147,8 @@ def decode_tlm_header(data):
 
 def decode_seq_tlm(data):
     """Decode SEQ HK telemetry (0x08D0) — matches WOK_Seq_HkTlm_t."""
-    if len(data) < 26:
-        return {"error": "short packet"}
     payload = data[16:]
-    if len(payload) < 10:
+    if len(payload) < struct.calcsize("<HHBBHHH"):
         return {"error": "short payload"}
     # Real struct: uint16 cmd_cnt, uint16 err_cnt, uint8 state, uint8 prev_state,
     #              uint16 wp_idx, uint16 fault_mask, uint16 seq_id
@@ -156,10 +170,8 @@ def decode_seq_tlm(data):
 
 def decode_seq_mode_tlm(data):
     """Decode SEQ MODE telemetry (0x08D1) — matches WOK_Seq_ModeTlm_t."""
-    if len(data) < 24:
-        return {"error": "short packet"}
     payload = data[16:]
-    if len(payload) < 8:
+    if len(payload) < struct.calcsize("<BBHHH"):
         return {"error": "short payload"}
     # Real struct: uint8 state, uint8 loop_count, uint16 total_wp, uint16 fault_mask, uint16 spare
     state, loop_cnt, total_wp, fault_mask, spare = struct.unpack_from("<BBHHH", payload, 0)
@@ -171,7 +183,7 @@ def decode_seq_mode_tlm(data):
         "total_waypoints": total_wp,
         "faults": decode_fault_bits(fault_mask),
     }
-    # v4.0 targeting status
+    # Targeting status (appended fields)
     if len(payload) >= 16:
         mode, drills, best_idx, _sp, best_score = struct.unpack_from("<BBBBf", payload, 8)
         d.update({
@@ -183,13 +195,13 @@ def decode_seq_mode_tlm(data):
     return d
 
 def decode_nav_tlm(data):
-    """Decode NAV HK telemetry (0x08D2)."""
-    if len(data) < 24:
-        return {"error": "short packet"}
+    """Decode NAV HK telemetry (0x08D2) — matches WOK_Nav_HkTlm_t."""
     payload = data[16:]
-    if len(payload) < 8:
+    if len(payload) < struct.calcsize("<HHBBH"):
         return {"error": "short payload"}
-    cmd_cnt, err_cnt, drive_state, fault_raw = struct.unpack_from("<BBBb", payload, 0)
+    # Real struct: uint16 cmd_cnt, uint16 err_cnt, uint8 drive_state, uint8 spare,
+    #              uint16 fault_mask
+    cmd_cnt, err_cnt, drive_state, _spare, fault_raw = struct.unpack_from("<HHBBH", payload, 0)
     drive_states = ["IDLE", "DRIVING", "ARRIVED", "STOPPED", "FAULT"]
     return {
         "app": "NAV", "type": "HK",
@@ -200,10 +212,8 @@ def decode_nav_tlm(data):
 
 def decode_nav_status_tlm(data):
     """Decode NAV STATUS telemetry (0x08D3) — matches WOK_Nav_StatusTlm_t."""
-    if len(data) < 40:
-        return {"error": "short packet"}
     payload = data[16:]
-    if len(payload) < 24:
+    if len(payload) < struct.calcsize("<fffffBBHHH"):
         return {"error": "short payload"}
     # Real struct: float px, py, hdg, spd, tilt, uint8 drive_state, uint8 arrived,
     #              uint16 faults, uint16 seq_id, uint16 spare
@@ -229,13 +239,13 @@ def decode_nav_status_tlm(data):
     return d
 
 def decode_geo_tlm(data):
-    """Decode GEO HK telemetry (0x08D4)."""
-    if len(data) < 24:
-        return {"error": "short packet"}
+    """Decode GEO HK telemetry (0x08D4) — matches WOK_Geo_HkTlm_t."""
     payload = data[16:]
-    if len(payload) < 8:
+    if len(payload) < struct.calcsize("<HHBBH"):
         return {"error": "short payload"}
-    cmd_cnt, err_cnt, mech_state, fault_raw = struct.unpack_from("<BBBb", payload, 0)
+    # Real struct: uint16 cmd_cnt, uint16 err_cnt, uint8 mech_state, uint8 spare,
+    #              uint16 fault_mask
+    cmd_cnt, err_cnt, mech_state, _spare, fault_raw = struct.unpack_from("<HHBBH", payload, 0)
     mech_states = ["STOWED", "DEPLOYING", "DEPLOYED", "STOWING", "FAULT"]
     return {
         "app": "GEO", "type": "HK",
@@ -246,10 +256,8 @@ def decode_geo_tlm(data):
 
 def decode_geo_status_tlm(data):
     """Decode GEO STATUS telemetry (0x08D5) — matches WOK_Geo_StatusTlm_t."""
-    if len(data) < 32:
-        return {"error": "short packet"}
     payload = data[16:]
-    if len(payload) < 16:
+    if len(payload) < struct.calcsize("<BBBBfHHHH"):
         return {"error": "short payload"}
     # Real struct: uint8 mech_state, uint8 endstop_dep, uint8 endstop_stow, uint8 spare,
     #              float motor_i, uint16 faults, uint16 timeout_cnt, uint16 seq_id, uint16 spare
@@ -286,46 +294,45 @@ def decode_geo_status_tlm(data):
     return d
 
 def decode_seis_tlm(data):
-    """Decode SEIS HK telemetry (0x08D6)."""
-    if len(data) < 24:
-        return {"error": "short packet"}
+    """Decode SEIS HK telemetry (0x08D6) — matches WOK_Seis_HkTlm_t."""
     payload = data[16:]
-    if len(payload) < 8:
+    if len(payload) < struct.calcsize("<HHBBH"):
         return {"error": "short payload"}
-    cmd_cnt, err_cnt, acquiring, qc_flags = struct.unpack_from("<BBBB", payload, 0)
+    # Real struct: uint16 cmd_cnt, uint16 err_cnt, uint8 acquiring,
+    #              uint8 source_state, uint16 fault_mask
+    cmd_cnt, err_cnt, acquiring, source_state, fault_raw = struct.unpack_from("<HHBBH", payload, 0)
     return {
         "app": "SEIS", "type": "HK",
         "cmd_cnt": cmd_cnt, "err_cnt": err_cnt,
         "acquiring": bool(acquiring),
-        "qc_flags": qc_flags,
+        "source_state": SOURCE_STATES[source_state] if source_state < len(SOURCE_STATES) else f"UNK({source_state})",
+        "fault_raw": fault_raw,
+        "faults": decode_fault_bits(fault_raw),
     }
 
 def decode_seis_status_tlm(data):
-    """Decode SEIS STATUS telemetry (0x08D7) — matches WOK_Seis_StatusTlm_t v2.1."""
-    if len(data) < 28:
-        return {"error": "short packet"}
+    """Decode SEIS STATUS telemetry (0x08D7) — matches WOK_Seis_StatusTlm_t."""
     payload = data[16:]
-    if len(payload) < 12:
+    if len(payload) < struct.calcsize("<BBBBHHHH"):
         return {"error": "short payload"}
-    # v2.1 struct: uint8 acquiring, qc_clip, qc_dead, qc_drop,
-    #              uint16 samples_k, duration, fs, faults,
-    #              uint8 thumper_state, eval_flag, uint16 spare2,
-    #              float eval_confidence, float thumper_force_n
-    thumper_states = ["IDLE", "CHARGING", "ARMED", "FIRED", "SWEEPING"]
+    # Struct prefix: uint8 acquiring, qc_clip, qc_dead, qc_drop,
+    #                uint16 samples_k, duration, fs, faults,
+    #                uint8 source_state, eval_flag, uint16 seq_id,
+    #                float eval_confidence, float source_force_n
     acquiring, qc_clip, qc_dead, qc_drop, samples_k, duration, fs, fault_raw = struct.unpack_from(
         "<BBBBHHHH", payload, 0
     )
     # Try to decode extended fields if payload is large enough
-    thumper_state = 0
+    source_state = 0
     eval_flag = 0
     seq_id = 0
     eval_confidence = 0.0
-    thumper_force = 0.0
+    source_force = 0.0
     if len(payload) >= 24:
-        thumper_state, eval_flag, seq_id, eval_confidence, thumper_force = struct.unpack_from(
+        source_state, eval_flag, seq_id, eval_confidence, source_force = struct.unpack_from(
             "<BBHff", payload, 12
         )
-    # v2.4 appended fields: strike-to-trace sync + trace buffer fill
+    # Appended fields: strike-to-trace sync + trace buffer fill
     strike_sample_idx = 0
     strike_valid = False
     trace_samples = 0
@@ -334,7 +341,7 @@ def decode_seis_status_tlm(data):
             "<IB3xI", payload, 24
         )
         strike_valid = bool(strike_valid_u8)
-    # v2.5 stack + first-break picks
+    # Stack + first-break picks (appended)
     first_break_ms = []
     pick_quality = []
     stack_fold = 0
@@ -344,13 +351,13 @@ def decode_seis_status_tlm(data):
         q = struct.unpack_from("<BBBBBB", payload, 52)
         pick_quality = list(q[:4])
         stack_fold, coherence_pct = q[4], q[5]
-    # v3.0 onboard refraction inversion
+    # Onboard refraction inversion (appended)
     eval_inv = {}
     if len(payload) >= 76:
         v1, v2, h1, icefrac = struct.unpack_from("<ffff", payload, 60)
         eval_inv = {"eval_v1_mps": round(v1, 0), "eval_v2_mps": round(v2, 0),
                     "eval_depth_m": round(h1, 2), "eval_ice_frac": round(icefrac, 2)}
-    # v5.0 EM source: mode, bank, sweep + correlation progress
+    # EM source: mode, bank, sweep + correlation progress (appended)
     src = {}
     if len(payload) >= 84:
         src_mode, bank_soc, sweep_pct, corr_pct, bank_v = \
@@ -398,10 +405,10 @@ def decode_seis_status_tlm(data):
         "duration_sec": duration,
         "sample_rate_hz": fs,
         "faults": decode_fault_bits(fault_raw),
-        "thumper_state": thumper_states[thumper_state] if thumper_state < len(thumper_states) else f"UNK({thumper_state})",
+        "source_state": SOURCE_STATES[source_state] if source_state < len(SOURCE_STATES) else f"UNK({source_state})",
         "eval_flag": bool(eval_flag),
         "eval_confidence": round(eval_confidence, 2),
-        "thumper_force_n": round(thumper_force, 1),
+        "source_force_n": round(source_force, 1),
         "seq_id": seq_id,
         "strike_sample_idx": strike_sample_idx,
         "strike_valid": strike_valid,
@@ -415,33 +422,32 @@ def decode_seis_status_tlm(data):
     }
 
 def decode_seis_quicklook(data):
-    """Decode SEIS QUICKLOOK telemetry (0x08D8)."""
-    if len(data) < 68:
-        return {"error": "short packet"}
+    """Decode SEIS QUICKLOOK telemetry (0x08D8) — matches WOK_Seis_QuicklookTlm_t.
+    Planar layout: float RMS[4], float Peak[4], float DC_Offset[4],
+    uint16 SampleRate_Hz, uint16 Spare."""
     payload = data[16:]
-    channels = []
-    for i in range(4):
-        off = i * 12
-        if off + 12 > len(payload):
-            break
-        rms, peak, dc = struct.unpack_from("<fff", payload, off)
-        channels.append({
-            "channel": i,
-            "rms": round(rms, 2),
-            "peak": round(peak, 2),
-            "dc_offset": round(dc, 2),
-        })
+    if len(payload) < struct.calcsize("<4f4f4fHH"):
+        return {"error": "short payload"}
+    rms = struct.unpack_from("<4f", payload, 0)
+    peak = struct.unpack_from("<4f", payload, 16)
+    dc = struct.unpack_from("<4f", payload, 32)
+    fs, _spare = struct.unpack_from("<HH", payload, 48)
+    channels = [{
+        "channel": i,
+        "rms": round(rms[i], 2),
+        "peak": round(peak[i], 2),
+        "dc_offset": round(dc[i], 2),
+    } for i in range(4)]
     return {
         "app": "SEIS", "type": "QUICKLOOK",
         "channels": channels,
+        "sample_rate_hz": fs,
     }
 
 def decode_hk_tlm(data):
     """Decode HK_HEALTH telemetry (0x08D9) — matches WOK_Hk_HealthTlm_t."""
-    if len(data) < 44:
-        return {"error": "short packet"}
     payload = data[16:]
-    if len(payload) < 28:
+    if len(payload) < struct.calcsize("<HHffffffHBBBBBB"):
         return {"error": "short payload"}
     # Real struct: uint16 cmd_cnt, uint16 err_cnt,
     #              float batt_v, batt_soc, temp_brd, temp_mot, tilt, cpu,
@@ -469,10 +475,8 @@ def decode_hk_tlm(data):
 
 def decode_drill_tlm(data):
     """Decode DRILL HK telemetry (0x08DA) — matches WOK_Drill_HkTlm_t."""
-    if len(data) < 32:
-        return {"error": "short packet"}
     payload = data[16:]
-    if len(payload) < 16:
+    if len(payload) < struct.calcsize("<HHBBHHHff"):
         return {"error": "short payload"}
     cmd_cnt, err_cnt, state, prev_state, fault_mask, seq_id, spare, arm_angle, depth = struct.unpack_from(
         "<HHBBHHHff", payload, 0
@@ -494,10 +498,8 @@ def decode_drill_tlm(data):
 
 def decode_drill_status_tlm(data):
     """Decode DRILL STATUS telemetry (0x08DB) — matches WOK_Drill_StatusTlm_t."""
-    if len(data) < 48:
-        return {"error": "short packet"}
     payload = data[16:]
-    if len(payload) < 32:
+    if len(payload) < struct.calcsize("<BBBB ff BBBB ffff BBBB fff"):
         return {"error": "short payload"}
     (arm_hal, _, _, _,
      arm_angle, arm_current,
@@ -526,7 +528,7 @@ def decode_drill_status_tlm(data):
         "vapor_pressure": round(vapor_pressure, 1),
         "volatile_conc": round(volatile_conc, 1),
     }
-    # v1.1 stiffness-log channels
+    # Stiffness-log channels (appended)
     if len(payload) >= 56:
         wob, rop = struct.unpack_from("<ff", payload, 48)
         d.update({"wob_N": round(wob, 1), "rop_mps": round(rop, 4)})
@@ -577,7 +579,7 @@ TLM_DECODERS[WokMid.GEO_STATUS_TLM] = decode_geo_status_tlm
 def decode_seis_filechunk(data):
     """Decode SEIS FILECHUNK (0x08DC) — metadata only for the web UI;
     reassembly is the console's job (seis.fetch)."""
-    if len(data) < 16 + 36:
+    if len(data) < 16 + struct.calcsize("<24sIIHH"):
         return {"error": "short packet"}
     raw_name, fsize, offset, dlen = struct.unpack_from("<24sIIH", data, 16)
     return {
@@ -592,7 +594,7 @@ def decode_seis_filechunk(data):
 TLM_DECODERS[WokMid.SEIS_TLM]       = decode_seis_tlm
 TLM_DECODERS[WokMid.SEIS_STATUS_TLM]= decode_seis_status_tlm
 TLM_DECODERS[WokMid.SEIS_QUICKLOOK] = decode_seis_quicklook
-TLM_DECODERS[0x08DC]                = decode_seis_filechunk
+TLM_DECODERS[WokMid.SEIS_FILECHUNK] = decode_seis_filechunk
 TLM_DECODERS[WokMid.HK_TLM]         = decode_hk_tlm
 TLM_DECODERS[WokMid.DRILL_TLM]      = decode_drill_tlm
 TLM_DECODERS[WokMid.DRILL_STATUS_TLM] = decode_drill_status_tlm
@@ -676,7 +678,7 @@ def build_command(app, action, params=None):
         ("seis", "thump_fire"): (WokMid.SEIS_CMD, 5, SID),
         ("seis", "thump_reset"):(WokMid.SEIS_CMD, 6, SID),
         ("seis", "evaluate"):   (WokMid.SEIS_CMD, 7, SID),
-        # Dual-mode EM source config (v5.0): zero params keep onboard
+        # Dual-mode EM source config: zero params keep onboard
         # settings; mode 0 = impulse, 1 = sweep
         ("seis", "source"):  (WokMid.SEIS_CMD, 9, SID + struct.pack("<BBBBffff",
                                 params.get("mode", 0), 0, 0, 0,
@@ -729,11 +731,12 @@ class WokBridge:
     fabricated here — to run without hardware, run cFS with the
     linux_sim HAL."""
 
-    def __init__(self, cfs_host, cmd_port, tlm_port, ws_port):
+    def __init__(self, cfs_host, cmd_port, tlm_port, ws_port, ws_host="127.0.0.1"):
         self.cfs_host = cfs_host
         self.cmd_port = cmd_port
         self.tlm_port = tlm_port
         self.ws_port = ws_port
+        self.ws_host = ws_host
         self.clients = set()
         self.latest_tlm = {}
         self.cmd_sock = None
@@ -743,19 +746,25 @@ class WokBridge:
     async def start(self):
         self.running = True
 
-        # Set up UDP sockets
+        # Set up UDP sockets. The telemetry socket is bound to the address
+        # TO_LAB is told to send to (127.0.0.1 for a local cFS, this host's
+        # LAN address for a remote one) rather than to all interfaces.
+        tlm_bind = local_ip_toward(self.cfs_host)
         self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.tlm_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.tlm_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.tlm_sock.bind(("0.0.0.0", self.tlm_port))
+        self.tlm_sock.bind((tlm_bind, self.tlm_port))
         self.tlm_sock.setblocking(False)
 
         # Start WebSocket server
-        print(f"[WOK Bridge] WebSocket server on ws://0.0.0.0:{self.ws_port}")
+        print(f"[WOK Bridge] WebSocket server on ws://{self.ws_host}:{self.ws_port}")
+        if self.ws_host not in ("127.0.0.1", "localhost", "::1"):
+            print("[WOK Bridge] WARNING: WebSocket exposed beyond localhost with NO"
+                  " authentication — trusted LAN only")
         print(f"[WOK Bridge] cFS command target: {self.cfs_host}:{self.cmd_port}")
-        print(f"[WOK Bridge] Telemetry listen: 0.0.0.0:{self.tlm_port}")
+        print(f"[WOK Bridge] Telemetry listen: {tlm_bind}:{self.tlm_port}")
 
-        async with websockets.serve(self.ws_handler, "0.0.0.0", self.ws_port):
+        async with websockets.serve(self.ws_handler, self.ws_host, self.ws_port):
             await self.tlm_recv_loop()
 
     async def ws_handler(self, websocket):
@@ -775,7 +784,7 @@ class WokBridge:
                     "data": self.latest_tlm,
                     "timestamp": time.time(),
                 }))
-            except:
+            except websockets.exceptions.ConnectionClosed:
                 pass
 
         try:
@@ -845,10 +854,12 @@ class WokBridge:
 
     async def tlm_recv_loop(self):
         """Receive UDP telemetry and broadcast to WebSocket clients."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         while self.running:
             try:
-                data = await loop.run_in_executor(None, lambda: self.tlm_sock.recv(4096))
+                # Event-loop-native receive on the non-blocking socket:
+                # no executor thread, no busy-poll
+                data = await loop.sock_recv(self.tlm_sock, 4096)
                 if len(data) < 6:
                     continue
 
@@ -871,7 +882,7 @@ class WokBridge:
                         "data": decoded,
                         "timestamp": time.time(),
                     })
-                    await self.broadcast(msg)
+                    self.broadcast(msg)
                 else:
                     # Unknown MID — broadcast raw hex for debugging
                     msg = json.dumps({
@@ -881,10 +892,8 @@ class WokBridge:
                         "size": len(data),
                         "timestamp": time.time(),
                     })
-                    await self.broadcast(msg)
+                    self.broadcast(msg)
 
-            except BlockingIOError:
-                await asyncio.sleep(0.01)
             except Exception as e:
                 if self.running:
                     print(f"[WOK Bridge] TLM error: {e}")
@@ -892,17 +901,12 @@ class WokBridge:
 
     # ─── Client Broadcast ───────────────────────────────────────────
 
-    async def broadcast(self, message):
-        """Send message to all connected WebSocket clients."""
-        if not self.clients:
-            return
-        disconnected = set()
-        for ws in self.clients:
-            try:
-                await ws.send(message)
-            except websockets.exceptions.ConnectionClosed:
-                disconnected.add(ws)
-        self.clients -= disconnected
+    def broadcast(self, message):
+        """Send message to all connected WebSocket clients. Closed
+        connections are skipped by websockets.broadcast and removed from
+        self.clients by their own ws_handler on exit."""
+        if self.clients:
+            websockets.broadcast(self.clients, message)
 
 
 # ─── Main ───────────────────────────────────────────────────────────────
@@ -913,9 +917,12 @@ def main():
     parser.add_argument("--cmd-port", type=int, default=1234, help="CI_LAB UDP port")
     parser.add_argument("--tlm-port", type=int, default=2234, help="TO_LAB UDP port")
     parser.add_argument("--ws-port", type=int, default=8765, help="WebSocket server port")
+    parser.add_argument("--ws-host", default="127.0.0.1",
+                        help="WebSocket listen address (default 127.0.0.1; "
+                             "0.0.0.0 exposes the UNAUTHENTICATED bridge to the LAN)")
     args = parser.parse_args()
 
-    bridge = WokBridge(args.cfs_host, args.cmd_port, args.tlm_port, args.ws_port)
+    bridge = WokBridge(args.cfs_host, args.cmd_port, args.tlm_port, args.ws_port, args.ws_host)
     try:
         asyncio.run(bridge.start())
     except KeyboardInterrupt:

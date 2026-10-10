@@ -9,7 +9,7 @@
 
 ## 1. Mission Overview
 
-WOK (Water Observation Kit) is a lunar seismic survey and ice prospecting rover that autonomously traverses a set of waypoints, deploys geophones, records stacked seismic shots from a dual-mode electromagnetic source, picks first-break arrivals onboard, evaluates for ice signatures, and optionally drills for sampling with evolved-gas volatile analysis. Every data product is stamped with the surveyed site pose, so seismic and drill results at the same site form a calibration tie point — the basis of the Vp→ice-content transfer function that lets the seismic survey claim deposits below drill depth (see `WOK_Capability_Gap_Analysis.md`).
+WOK (Water Observation Kit) is a lunar seismic survey and ice prospecting rover that autonomously traverses a set of waypoints, deploys geophones, records stacked seismic shots from a dual-mode electromagnetic source, picks first-break arrivals onboard, evaluates for ice signatures, and optionally drills for sampling with evolved-gas volatile analysis. Every data product is stamped with the surveyed site pose, so seismic and drill results at the same site form a calibration tie point — the basis of the Vp→ice-content transfer function that lets the seismic survey estimate ice content at the sites that were not drilled.
 
 **Operational loop:**
 
@@ -19,16 +19,25 @@ THUMP starts the acquisition *before* arming and firing (pre-trigger), so the sh
 
 In per-pod placement mode (`SET_PLACEMENT`, CP-3/4/5) DEPLOY is the placement sub-sequence (MOVE_TO each pod → place → seating-force gate with bounded reseats), VERIFY fires a low-energy coupling test shot with targeted pod reseats and the partial-array policy, and STOW is the retrieval mirror with per-pod recapture confirmation. Fixed-array mode (default) never enters VERIFY and preserves the legacy command stream exactly.
 
-**Seismic source (v5.0):** a capacitor-bank-driven EM actuator striking a coupling plate, replacing the v2.x drop-weight thumper. Two modes, selectable per shot (and per waypoint via `LOAD_WAYPOINT`):
+**Seismic source:** a capacitor-bank-driven EM actuator striking a coupling plate (an earlier design used a drop weight; a few `Source*` telemetry names date from it). Two modes, selectable per shot (and per waypoint via `LOAD_WAYPOINT`):
 
-- **IMPULSE** (default) — cap discharge → single strike. Commanded energy sets the bank charge level; gravity-independent. Default energy reproduces the drop-weight amplitude, so legacy missions behave identically.
+- **IMPULSE** (default) — cap discharge → single strike. Commanded energy sets the bank charge level; gravity-independent.
 - **SWEEP** — the same actuator driven with a linear swept-sine pilot (force-limited, for long-offset work). The record window extends to sweep + listen time; SEIS cross-correlates the record against the analytically regenerated pilot onboard (chunked across HK ticks) and the resulting equivalent-impulse trace feeds the existing picker/stacker/EVALUATE chain unchanged.
 
 t₀ is electrical: FIRE (discharge or sweep start) latches the ADC sample index on the shared clock — no mechanical release detection. ARM = bank charge (non-blocking, draws from the battery bus; the sequencer's arm timeout covers a bank that cannot charge on a sagging bus).
 
 Any critical fault triggers transition to SAFE mode (NAV stop, GEO stow, SEIS stop, DRILL e-stop), where the vehicle awaits ground commands. Drill is conditional on ice detection + battery voltage + waypoint drill flag.
 
-**Mission modes (v4.0):** In the default *drill-inline* mode, flagged sites drill as they are found. In *survey-first* mode the rover scores every site, then returns to the argmax-score site and drills it. Either way, the **tie-point mission-success gate** guarantees at least one drill inside the survey footprint before DONE — the calibration tie is what converts the seismic survey from relative to absolute ice content (see §4.1 Targeting).
+**Mission modes:** In the default *drill-inline* mode, flagged sites drill as they are found. In *survey-first* mode the rover scores every site, then returns to the argmax-score site and drills it. Either way, the **tie-point mission-success gate** guarantees at least one drill inside the survey footprint before DONE — the calibration tie is what converts the seismic survey from relative to absolute ice content (see §4.1 Targeting).
+
+### 1.1 Terminology
+
+- **Pod** — one geophone package (hardware). **Channel** — the data stream from one pod (four channels, pods at 1.5/3.0/4.5/6.0 m).
+- **Head wave / refractor** — the arrival that travels along the top of the faster second layer; "ice-fast" in the code means a refractor velocity above `WOK_SEIS_EVAL_V2_ICE_MPS` (1200 m/s), taken as ice-cemented regolith.
+- **Fold** — number of shots summed into a site's stack. **Stack correlation** — zero-lag normalised correlation of each new record against the running stack (telemetry key `coherence_pct`).
+- **CP-1 … CP-6** — the coupling-and-placement requirement set (internally WOK-CP-001): CP-1 the ground-coupling truth model in the sim; CP-2 the plate transfer metric and reseat branch; CP-3 per-pod placement; CP-4 test-shot coupling verification with targeted reseats; CP-5 the per-pod sync/pick-consistency check; CP-6 per-pod recapture confirmation on retrieval.
+- **EDI** — extraction-difficulty index used by `wok_refraction.py` when ranking prospects: binding ease (pore ice cheap, hydrated minerals expensive) × a depth factor.
+- **ppm** — parts per million by mass of sample (1 wt% = 10⁴ ppm), never a gas mixing ratio.
 
 ## 2. Software Architecture
 
@@ -82,7 +91,7 @@ The sequencer orchestrates the mission by sending commands to child apps and rec
     SEQ_MODE_TLM --------------------------> HK
     HK --HK_TLM--> (ground + SEQ safety check)
 
-SCH_LAB sends periodic SEND_HK wakeups (1 Hz) to all six apps, which triggers telemetry publication through TO_LAB to the ground console.
+SCH_LAB sends periodic SEND_HK wakeups (every 4th 10 ms tick, about 25 Hz, with the stock SCH_LAB table) to all six apps, which triggers telemetry publication through TO_LAB to the ground console.
 
 ## 3. Message ID Allocation
 
@@ -93,7 +102,7 @@ All WOK MIDs are allocated at topic offset 0xD0+ to avoid collisions with stock 
 | MID | Name | Direction | Description |
 |-----|------|-----------|-------------|
 | 0x18D0 | WOK_SEQ_CMD | Ground → SEQ | Sequencer commands |
-| 0x18D1 | WOK_SEQ_SEND_HK | SCH → SEQ | Housekeeping wakeup (1 Hz state machine tick) |
+| 0x18D1 | WOK_SEQ_SEND_HK | SCH → SEQ | Housekeeping wakeup (the state-machine tick, ~25 Hz with the stock table) |
 | 0x18D2 | WOK_NAV_CMD | SEQ/Ground → NAV | GoTo, Stop, SetSpeed, SetPose, Realign |
 | 0x18D3 | WOK_NAV_SEND_HK | SCH → NAV | Housekeeping wakeup |
 | 0x18D4 | WOK_GEO_CMD | SEQ/Ground → GEO | Deploy, Stow, Abort, PlacePod, RetrievePod, ReseatPod |
@@ -190,9 +199,9 @@ exactly these offsets.
 | 9 | SET_PLACEMENT | uint8 p | 0 = fixed array (legacy, default), 1 = per-pod placement (CP-3) |
 | 10 | RELEASE | — | Release a recalibration HOLD (rejected outside HOLD) |
 
-**Targeting (v4.0):** Every surveyed site's `EvalIceFrac` and absolute pose are recorded. In **survey-first** mode no site drills inline; after the last waypoint the sequencer returns to the argmax-score site (navigating by pose delta) and drills it. The **tie-point mission-success gate** applies in both modes: a mission may not end DONE with zero drills — the rover returns to its best-scoring site and drills regardless of score (a dry tie still calibrates the transfer function's dry end), battery permitting.
+**Targeting:** Every surveyed site's `EvalIceFrac` and absolute pose are recorded. In **survey-first** mode no site drills inline; after the last waypoint the sequencer returns to the argmax-score site (navigating by pose delta) and drills it. The **tie-point mission-success gate** applies in both modes: a mission may not end DONE with zero drills — the rover returns to its best-scoring site and drills regardless of score (a dry tie still calibrates the transfer function's dry end), battery permitting.
 
-**Safety Inhibits:** Battery voltage (22V, 23.5V for drill), tilt angle (30°), temperature (55°C) — all table-driven thresholds. Checked on every state machine cycle.
+**Safety Inhibits:** Battery voltage (22V, 23.5V for drill), tilt angle (30°), temperature (55°C) — compile-time defaults in `wok_platform_cfg.h`, ground-settable via SET_THRESHOLDS. Checked on every state machine cycle.
 
 ### 4.2 WOK_NAV (Navigation)
 
@@ -277,11 +286,11 @@ All commands include a `uint16 SeqId` field echoed back in status telemetry.
 
 **Sweep correlation:** after a sweep record completes, the app regenerates the pilot analytically (`WOK_HAL_Src_PilotSample` — the same contract function the source hardware drives) and cross-correlates the record against it over the stack window. The work is chunked at `WOK_SEIS_CORR_SAMPS_PER_TICK` output samples per HK tick so the main loop never blocks longer than one tick; `Acquiring` stays asserted in TLM until the correlated trace is stacked, so the sequencer's RECORD state waits naturally. The output is delayed by `WOK_SEIS_CORR_LEAD_FRAC/(f1−f0)` to convert the zero-phase correlation (Klauder) wavelet to an effectively causal one — onset picks on the equivalent-impulse trace then agree with true impulse picks (±0.25 ms in the physics harness). The correlated trace is archived as `corr_NNNN.wok` and is what feeds the site stack — sweep-mode stacks are stacks of correlated traces, and the picker/EVALUATE chain runs on them unchanged.
 
-**Stacking:** Each site's records are summed aligned on their own strike t₀ over a 2 s window ([−200 ms, +1800 ms]). Fold and zero-lag coherence are tracked; after the site's final strike the stack is archived as `stack_NNNN.wok` (header v2 with fold, coherence, picks).
+**Stacking:** Each site's records are summed aligned on their own strike t₀ over a 2 s window ([−200 ms, +1800 ms]). Fold and zero-lag stack correlation (telemetry key `coherence_pct`) are tracked; after the site's final strike the stack is archived as `stack_NNNN.wok` (header v2 with fold, coherence, picks).
 
 **First-break picker:** STA/LTA with the LTA frozen from the pre-strike noise window (standard for triggered records), onset refined to the first amplitude excursion above 4× noise RMS. `FirstBreakMs[4]` + `PickQuality[4]` (0–100) go to Status TLM and the stack file header.
 
-**Onboard evaluate (pick-based):** EVALUATE runs a two-layer refraction grid inversion over the picks — v1 from the near pod pair, (v2, h1) grid with implicit direct/head-wave branch assignment, cells weighted by pick-misfit likelihood × a uniform-in-slowness prior. The verdict is the posterior mass on ice-fast refractors (`EvalIceFrac`); the site is flagged at ≥ 0.30. `EvalV1_mps`, `EvalV2_mps`, `EvalDepthM`, `EvalIceFrac` are appended to Status TLM as the evidence behind the flag. The HAL evaluate is only a fallback when no picks exist. Ground-side, `ground/wok_refraction.py` runs the same inversion with uncertainty ranges plus drill-log competence/evolved-gas analysis and the tie-point report.
+**Onboard evaluate (pick-based):** EVALUATE runs a two-layer refraction grid inversion over the picks — v1 from the near pod pair, (v2, h1) grid with implicit direct/head-wave branch assignment, cells weighted by pick-misfit likelihood × a uniform-in-slowness prior. The verdict is the posterior mass on ice-fast refractors (`EvalIceFrac`); the site is flagged at ≥ 0.30. `EvalV1_mps`, `EvalV2_mps`, `EvalDepthM`, `EvalIceFrac` are appended to Status TLM as the evidence behind the flag. The HAL evaluate is only a fallback when no picks exist. Ground-side, `ground/wok_refraction.py` runs the same inversion with uncertainty ranges plus drill-log competence/evolved-gas analysis and the tie-point report. If the picks cannot support an inversion (v₁ outside 100–600 m/s) the app falls back to `WOK_HAL_Seis_Evaluate`, which in the Linux sim reads the geology model directly: a **simulation oracle with no flight equivalent**, reported by event so a run cannot lean on it unnoticed.
 
 **QC Flags:** Computed from the real trace — clipped-sample counts per channel (during drain), dead channel from trace-tail RMS, dropout detection.
 
@@ -291,7 +300,7 @@ All commands include a `uint16 SeqId` field echoed back in status telemetry.
 
 ### 4.5 WOK_DRILL (Drill / Ice Prospector)
 
-**Purpose:** Deploy drill arm, drill regolith with a full stiffness log, thermal vaporization sampling with an evolved-gas record, volatile analysis.
+**Purpose:** Deploy drill arm, drill regolith with a drilling-response log, thermal vaporization sampling with an evolved-gas record, volatile analysis.
 
 **Command Codes:**
 
@@ -309,7 +318,7 @@ All commands include a `uint16 SeqId` field echoed back in status telemetry.
 
 **App States:** IDLE, DEPLOYING, ARM_READY, DRILLING, DRILL_DONE, SAMPLING, SAMPLE_DONE, STOWING, FAULT
 
-**Stiffness log:** WOB (weight-on-bit) is read from the HAL and a smoothed ROP is computed onboard; both are appended to STATUS TLM. Through DRILLING and SAMPLING the app logs (t, phase, depth, WOB, torque, current, cell temp, vapor pressure, ppm) rows at ≥500 ms spacing, archived per cycle as `drill_NNNN.wok` (format in `wok_drill_msgids.h`). The (depth, WOB, torque, ROP) columns form the regolith competence log; the (temp, ppm) columns during heating form the evolved-gas curve — the volatile *release temperature* is what classifies how the water is bound (adsorbed ≈110 °C, pore ice ≈160 °C, hydrated mineral ≈320 °C), which drives extraction cost. Volatiles bound above the 300 °C cell limit are intentionally under-recovered; ground corrects total abundance from the release curve.
+**Drilling-response log:** WOB (weight-on-bit) is read from the HAL and a smoothed ROP is computed onboard; both are appended to STATUS TLM. Through DRILLING and SAMPLING the app logs (t, phase, depth, WOB, torque, current, cell temp, vapor pressure, ppm) rows at ≥500 ms spacing, archived per cycle as `drill_NNNN.wok` (format in `wok_drill_msgids.h`). The (depth, WOB, torque, ROP) columns form the regolith competence log; the (temp, ppm) columns during heating form the evolved-gas curve — the volatile *release temperature* is what classifies how the water is bound (adsorbed ≈110 °C, pore ice ≈160 °C, hydrated mineral ≈320 °C), which drives extraction cost. Volatiles bound above the 300 °C cell limit are intentionally under-recovered; ground corrects total abundance from the release curve.
 
 **Fault Detection:** Arm jam, arm timeout, drill stall (torque), overcurrent, over-depth, thermal overtemp. All trigger FAULT state + e-stop.
 
@@ -330,7 +339,7 @@ All commands include a `uint16 SeqId` field echoed back in status telemetry.
 
 **Monitored Parameters:** Battery voltage, battery SOC, board temperature, motor temperature, tilt, CPU load, watchdog status.
 
-**FDIR Logic:** Table-driven thresholds. Any critical fault sets the SafeTrigger flag and fires an event. The sequencer checks this flag on every cycle. Faults re-assert on the next HK cycle if the condition persists — CLEAR_FAULTS only works if the underlying condition resolves.
+**FDIR Logic:** Thresholds are compile-time defaults (`wok_platform_cfg.h`), ground-settable via SET_THRESHOLDS. Any critical fault sets the SafeTrigger flag and fires an event. The sequencer checks this flag on every cycle. Faults re-assert on the next HK cycle if the condition persists — CLEAR_FAULTS only works if the underlying condition resolves.
 
 **Fault Bitmask:**
 
@@ -362,14 +371,14 @@ All hardware access goes through the WOK HAL API. The HAL is a per-subsystem sta
 | Storage | wok_hal_storage.h | Init, WriteFile, ReadFile, GetFreeSpace |
 | Watchdog | wok_hal_watchdog.h | Init, Pet |
 
-Key contract points added in v2.4/v2.5: `Seis_SetSite`/`Drill_SetSite` carry the surveyed pose into data products; `Seis_GetStrikeInfo` returns the shot's per-channel sample index (source drive and ADC must share a clock on real hardware); `Drill_GetWOB` reads the axial load cell; `Storage_ReadFile` backs the file-downlink path. v5.0: the source contract is dual-mode (`WOK_HAL_Src_*`) — arm charges a capacitor bank, abort is a safe bank dump, and the sweep pilot waveform is defined analytically in the header so the sim, the app's correlator, and a flight driver agree bit-for-bit.
+Key contract points: `Seis_SetSite`/`Drill_SetSite` carry the surveyed pose into data products; `Seis_GetStrikeInfo` returns the shot's per-channel sample index (source drive and ADC must share a clock on real hardware); `Drill_GetWOB` reads the axial load cell; `Storage_ReadFile` backs the file-downlink path. v5.0: the source contract is dual-mode (`WOK_HAL_Src_*`) — arm charges a capacitor bank, abort is a safe bank dump, and the sweep pilot waveform is defined analytically in the header so the sim, the app's correlator, and a flight driver agree bit-for-bit.
 
 **Implementations:**
 
 - `linux_sim` — Simulated physics for desktop testing. A **shared subsurface geology model** (`wok_hal_sim_geology.c`: 3 layers, a Gaussian ice lens peaking at 5 wt%, per-binding volatile release spectra) is the single source of truth for BOTH instruments: the seismic sim synthesizes real first arrivals (direct vs head wave, offset moveout, geometric spreading) from it — as damped-sine wavelets for impulse shots, or as the delayed contract pilot for sweeps — and the drill sim derives torque/ROP/volatiles-vs-depth from the same model, so a correct inversion of the synthetic seismic agrees with what the synthetic drill finds. All geology functions are pure: each app links its own copy of the HAL lib, and cross-app consistency comes from determinism, not shared memory. Plus kinematic drive model, timed geo transitions, the EM source (bank charges at 50 W from the battery model, inhibited below a 23.0 V bus; impulse force ∝ √energy, 8.5–9.5 N at the 50 J default) on the same monotonic clock as the ADC, and a battery discharge model (note: the battery drains in real time — a running core reaches the 23.5 V drill inhibit after ~25–30 min and the 22.0 V SAFE threshold after ~45–55 min; restart the core between mission runs).
 - `flight_stub` — Returns WOK_HAL_ERROR for everything. Copy and fill in real driver calls.
 
-## 5.1 Onboard Data Products
+### 5.1 Onboard Data Products
 
 All science products are flat binary files in `WOK_DATA_DIR` (`/tmp/wok_data` in
 the sim, `/cf/wok_data` on flight storage), little-endian, fetchable via the
@@ -394,7 +403,6 @@ All runtime behavior is compile-time configured via `wok_platform_cfg.h` and `wo
 |-----------|---------|-------------|
 | WOK_SEQ_MAX_WAYPOINTS | 64 | Maximum waypoints in table |
 | WOK_SEQ_NUM_WAYPOINTS | 7 | Default waypoints loaded |
-| WOK_SEQ_MAX_RETRIES | 3 | Fault retries before SAFE |
 | WOK_NAV_DEFAULT_MAX_SPEED_MPS | 0.5 | Maximum drive speed |
 | WOK_NAV_DEFAULT_ARRIVAL_TOL_M | 0.3 | Waypoint arrival tolerance |
 | WOK_SEIS_DEFAULT_FS_HZ | 4000 | Sample rate (pick quantization ±0.25 ms over the 6 m array) |
@@ -457,6 +465,8 @@ wok-cfs/                          This repository
 │   └── wok_refraction.py         Site analysis: refraction inversion, tie points, prospect ranking
 ├── tools/                        Dev/verification tooling
 │   ├── wok_sim.sh                One-command sim stack up/down/status
+│   ├── run_src_harness.sh        Build + run the physics harness modes (CI)
+│   ├── smoke_test.sh             Boot a built tree, check all six apps init (CI)
 │   ├── wok_mission_tools.py      Scriptable mission commands, fetch, validate
 │   ├── wok_regress.py            Regression comparison vs archived baseline
 │   └── wok_src_harness.c         Standalone sim-HAL physics harness

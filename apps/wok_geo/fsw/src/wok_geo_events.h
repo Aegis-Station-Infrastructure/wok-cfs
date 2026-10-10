@@ -14,6 +14,7 @@
 #define WOK_GEO_CMD_ERR_EID          4
 #define WOK_GEO_PIPE_ERR_EID         5
 #define WOK_GEO_LEN_ERR_EID          6
+#define WOK_GEO_SUB_ERR_EID          7
 #define WOK_GEO_DEPLOY_EID           10
 #define WOK_GEO_DEPLOYED_EID         11
 #define WOK_GEO_STOW_EID             12

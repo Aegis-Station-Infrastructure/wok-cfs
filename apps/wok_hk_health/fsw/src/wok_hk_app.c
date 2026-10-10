@@ -22,16 +22,28 @@ void WOK_Hk_AppMain(void)
 {
     int32 Status; CFE_SB_Buffer_t *BufPtr = NULL;
     CFE_ES_PerfLogEntry(WOK_HK_PERF_ID);
+    WOK_Hk_AppData.RunStatus = CFE_ES_RunStatus_APP_RUN;
     Status = WOK_Hk_AppInit();
-    if (Status != CFE_SUCCESS) return;
-    while (true) {
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_ES_WriteToSysLog("WOK_HK: Init failed (0x%08lX)\n", (unsigned long)Status);
+        WOK_Hk_AppData.RunStatus = CFE_ES_RunStatus_APP_ERROR;
+    }
+    while (CFE_ES_RunLoop(&WOK_Hk_AppData.RunStatus) == true) {
         CFE_ES_PerfLogExit(WOK_HK_PERF_ID);
         Status = CFE_SB_ReceiveBuffer(&BufPtr, WOK_Hk_AppData.CmdPipe, CFE_SB_PEND_FOREVER);
         CFE_ES_PerfLogEntry(WOK_HK_PERF_ID);
         if (Status == CFE_SUCCESS) WOK_Hk_ProcessCommandPacket(BufPtr);
-        else break;
+        else
+        {
+            CFE_EVS_SendEvent(WOK_HK_PIPE_ERR_EID, CFE_EVS_EventType_ERROR,
+                              "WOK_HK: SB pipe error (0x%08lX), app will exit",
+                              (unsigned long)Status);
+            WOK_Hk_AppData.RunStatus = CFE_ES_RunStatus_APP_ERROR;
+        }
     }
-    CFE_ES_ExitApp(CFE_ES_RunStatus_APP_ERROR);
+    CFE_ES_PerfLogExit(WOK_HK_PERF_ID);
+    CFE_ES_ExitApp(WOK_Hk_AppData.RunStatus);
 }
 
 int32 WOK_Hk_AppInit(void)
@@ -42,9 +54,27 @@ int32 WOK_Hk_AppInit(void)
     Status = CFE_SB_CreatePipe(&WOK_Hk_AppData.CmdPipe, WOK_HK_PIPE_DEPTH, WOK_HK_PIPE_NAME);
     if (Status != CFE_SUCCESS) return Status;
 
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_HK_CMD_MID),      WOK_Hk_AppData.CmdPipe);
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_HK_SEND_HK_MID),  WOK_Hk_AppData.CmdPipe);
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_SEQ_MODE_TLM_MID), WOK_Hk_AppData.CmdPipe);
+    Status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_HK_CMD_MID), WOK_Hk_AppData.CmdPipe);
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(WOK_HK_SUB_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "WOK_HK: Subscribe to CMD failed (0x%08lX)", (unsigned long)Status);
+        return Status;
+    }
+    Status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_HK_SEND_HK_MID), WOK_Hk_AppData.CmdPipe);
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(WOK_HK_SUB_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "WOK_HK: Subscribe to SEND_HK failed (0x%08lX)", (unsigned long)Status);
+        return Status;
+    }
+    Status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_SEQ_MODE_TLM_MID), WOK_Hk_AppData.CmdPipe);
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(WOK_HK_SUB_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "WOK_HK: Subscribe to SEQ mode TLM failed (0x%08lX)", (unsigned long)Status);
+        return Status;
+    }
 
     CFE_MSG_Init(CFE_MSG_PTR(WOK_Hk_AppData.HealthTlm.TlmHeader),
                  CFE_SB_ValueToMsgId(WOK_HK_TLM_MID), sizeof(WOK_Hk_HealthTlm_t));
@@ -58,14 +88,14 @@ int32 WOK_Hk_AppInit(void)
     WOK_Hk_AppData.SeqState      = (uint8)WOK_STATE_IDLE;
     WOK_Hk_AppData.CmdCounter    = 0;
     WOK_Hk_AppData.ErrCounter    = 0;
+    WOK_Hk_AppData.ModeTlmLenErrReported = 0;
 
-    /* Init HAL subsystems */
+    /* Master HAL init — brings up every subsystem, including Power and
+     * the Watchdog (the backend owns the watchdog timeout). */
     WOK_HAL_Init();
-    WOK_HAL_Power_Init();
-    WOK_HAL_Watchdog_Init(WOK_HK_WATCHDOG_TIMEOUT_MS);
 
     CFE_EVS_SendEvent(WOK_HK_INIT_INF_EID, CFE_EVS_EventType_INFORMATION,
-                      "WOK_HK: App initialised (v2.0.0)");
+                      "WOK_HK: App initialised (v" WOK_VERSION_STRING ")");
     return CFE_SUCCESS;
 }
 
@@ -103,11 +133,14 @@ void WOK_Hk_ProcessCommandPacket(CFE_SB_Buffer_t *BufPtr)
             WOK_Hk_CheckFaults();
             WOK_Hk_ReportHealth();
             break;
-        case WOK_SEQ_MODE_TLM_MID: {
-            WOK_Seq_ModeTlm_t *ModeTlm = (WOK_Seq_ModeTlm_t *)BufPtr;
-            WOK_Hk_AppData.SeqState = ModeTlm->State;
+        case WOK_SEQ_MODE_TLM_MID:
+            if (WOK_Hk_VerifyTlmLength(BufPtr, sizeof(WOK_Seq_ModeTlm_t),
+                                       &WOK_Hk_AppData.ModeTlmLenErrReported))
+            {
+                const WOK_Seq_ModeTlm_t *ModeTlm = (const WOK_Seq_ModeTlm_t *)BufPtr;
+                WOK_Hk_AppData.SeqState = ModeTlm->State;
+            }
             break;
-        }
         default: WOK_Hk_AppData.ErrCounter++; break;
     }
 }
@@ -121,7 +154,7 @@ void WOK_Hk_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
             if (WOK_Hk_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Hk_NoArgsCmd_t))) {
                 WOK_Hk_AppData.CmdCounter++;
                 CFE_EVS_SendEvent(WOK_HK_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
-                                  "WOK_HK: NOOP (v2.0.0)");
+                                  "WOK_HK: NOOP (v" WOK_VERSION_STRING ")");
             } break;
         case WOK_HK_RESET_CTRS_CC:
             if (WOK_Hk_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Hk_NoArgsCmd_t))) {
@@ -237,6 +270,30 @@ bool WOK_Hk_VerifyCmdLength(CFE_MSG_Message_t *MsgPtr, size_t ExpectedLength)
         CFE_EVS_SendEvent(WOK_HK_LEN_ERR_EID, CFE_EVS_EventType_ERROR,
                           "WOK_HK: Len err: exp %lu got %lu",
                           (unsigned long)ExpectedLength, (unsigned long)ActualLength);
+        return false;
+    }
+    return true;
+}
+
+/* Length check for another app's telemetry before it is cast/copied.
+ * Child TLM arrives every SEND_HK tick, so a mismatch is evented once
+ * (per *Reported flag) and counted thereafter. */
+bool WOK_Hk_VerifyTlmLength(const CFE_SB_Buffer_t *BufPtr, size_t ExpectedLength,
+                            uint8 *Reported)
+{
+    size_t ActualLength = 0;
+    CFE_MSG_GetSize(&BufPtr->Msg, &ActualLength);
+    if (ActualLength != ExpectedLength) {
+        WOK_Hk_AppData.ErrCounter++;
+        if (!*Reported) {
+            CFE_SB_MsgId_t MsgId = CFE_SB_INVALID_MSG_ID;
+            CFE_MSG_GetMsgId(&BufPtr->Msg, &MsgId);
+            *Reported = 1;
+            CFE_EVS_SendEvent(WOK_HK_TLM_LEN_ERR_EID, CFE_EVS_EventType_ERROR,
+                              "WOK_HK: TLM len err MID 0x%04X: exp %lu got %lu (further errors counted only)",
+                              (unsigned int)CFE_SB_MsgIdToValue(MsgId),
+                              (unsigned long)ExpectedLength, (unsigned long)ActualLength);
+        }
         return false;
     }
     return true;

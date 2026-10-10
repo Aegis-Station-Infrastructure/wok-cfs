@@ -9,7 +9,6 @@
 ** cFS app for managing the drill arm, regolith sampling,
 ** thermal vaporization, and volatile analysis.
 **
-** Follows the same pattern as wok_geo / wok_nav:
 **   - Subscribe to CMD + SEND_HK on SB
 **   - Dispatch commands by command code
 **   - Publish HK + STATUS telemetry on SEND_HK wakeup
@@ -36,7 +35,7 @@ static void         WOK_Drill_RunFaultDetection(void);
 static void         WOK_Drill_UpdateStatus(void);
 static void         WOK_Drill_AppendLogRow(void);
 static void         WOK_Drill_WriteLogFile(void);
-static uint32_t     WOK_Drill_GetTimeMs(void);
+static uint32       WOK_Drill_GetTimeMs(void);
 
 /* ════════════════════════════════════════════════════════════════════
 ** Entry Point
@@ -48,22 +47,24 @@ void WOK_Drill_AppMain(void)
     CFE_SB_Buffer_t  *BufPtr;
     CFE_SB_MsgId_t    MsgId;
 
-    /* Register with ES */
+    CFE_ES_PerfLogEntry(WOK_DRILL_PERF_ID);
 
-    /* Initialize */
+    g_drill.RunStatus = CFE_ES_RunStatus_APP_RUN;
+
     status = WOK_Drill_Init();
     if (status != CFE_SUCCESS)
     {
-        CFE_EVS_SendEvent(0, CFE_EVS_EventType_ERROR,
+        CFE_EVS_SendEvent(WOK_DRILL_INIT_ERR_EID, CFE_EVS_EventType_ERROR,
             "WOK_DRILL: Init failed (0x%08lX)", (unsigned long)status);
-        CFE_ES_ExitApp(CFE_ES_RunStatus_APP_ERROR);
-        return;
+        g_drill.RunStatus = CFE_ES_RunStatus_APP_ERROR;
     }
 
     /* Main loop */
-    while (CFE_ES_RunLoop(NULL))
+    while (CFE_ES_RunLoop(&g_drill.RunStatus) == true)
     {
+        CFE_ES_PerfLogExit(WOK_DRILL_PERF_ID);
         status = CFE_SB_ReceiveBuffer(&BufPtr, g_drill.CmdPipe, CFE_SB_PEND_FOREVER);
+        CFE_ES_PerfLogEntry(WOK_DRILL_PERF_ID);
 
         if (status == CFE_SUCCESS)
         {
@@ -80,16 +81,24 @@ void WOK_Drill_AppMain(void)
                     break;
 
                 default:
-                    CFE_EVS_SendEvent(0, CFE_EVS_EventType_ERROR,
+                    CFE_EVS_SendEvent(WOK_DRILL_MID_ERR_EID, CFE_EVS_EventType_ERROR,
                         "WOK_DRILL: Unknown MsgId 0x%04X",
                         (unsigned int)CFE_SB_MsgIdToValue(MsgId));
                     g_drill.HkTlm.ErrCounter++;
                     break;
             }
         }
+        else
+        {
+            CFE_EVS_SendEvent(WOK_DRILL_PIPE_ERR_EID, CFE_EVS_EventType_ERROR,
+                "WOK_DRILL: SB pipe error (0x%08lX), app will exit",
+                (unsigned long)status);
+            g_drill.RunStatus = CFE_ES_RunStatus_APP_ERROR;
+        }
     }
 
-    CFE_ES_ExitApp(CFE_ES_RunStatus_APP_EXIT);
+    CFE_ES_PerfLogExit(WOK_DRILL_PERF_ID);
+    CFE_ES_ExitApp(g_drill.RunStatus);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -101,6 +110,7 @@ static CFE_Status_t WOK_Drill_Init(void)
     CFE_Status_t status;
 
     memset(&g_drill, 0, sizeof(g_drill));
+    g_drill.RunStatus = CFE_ES_RunStatus_APP_RUN;
 
     /* Set defaults from configuration */
     g_drill.MaxDepthM     = WOK_DRILL_DEFAULT_MAX_DEPTH_M;
@@ -124,12 +134,22 @@ static CFE_Status_t WOK_Drill_Init(void)
     /* Subscribe to command MID */
     status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_DRILL_CMD_MID),
                               g_drill.CmdPipe);
-    if (status != CFE_SUCCESS) return status;
+    if (status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(WOK_DRILL_INIT_ERR_EID, CFE_EVS_EventType_ERROR,
+            "WOK_DRILL: Subscribe to CMD failed (0x%08lX)", (unsigned long)status);
+        return status;
+    }
 
     /* Subscribe to SEND_HK MID */
     status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_DRILL_SEND_HK_MID),
                               g_drill.CmdPipe);
-    if (status != CFE_SUCCESS) return status;
+    if (status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(WOK_DRILL_INIT_ERR_EID, CFE_EVS_EventType_ERROR,
+            "WOK_DRILL: Subscribe to SEND_HK failed (0x%08lX)", (unsigned long)status);
+        return status;
+    }
 
     /* Initialize HK telemetry header */
     CFE_MSG_Init(&g_drill.HkTlm.TelemetryHeader.Msg,
@@ -144,7 +164,7 @@ static CFE_Status_t WOK_Drill_Init(void)
     /* Initialize HAL drill subsystem */
     if (WOK_HAL_Drill_Init() != WOK_HAL_OK)
     {
-        CFE_EVS_SendEvent(0, CFE_EVS_EventType_ERROR,
+        CFE_EVS_SendEvent(WOK_DRILL_HAL_ERR_EID, CFE_EVS_EventType_ERROR,
             "WOK_DRILL: HAL Drill Init failed");
         /* Non-fatal: continue, HAL calls will return errors */
     }
@@ -152,8 +172,8 @@ static CFE_Status_t WOK_Drill_Init(void)
     /* Storage for drill log files (each app owns its HAL lib copy) */
     WOK_HAL_Storage_Init();
 
-    CFE_EVS_SendEvent(1, CFE_EVS_EventType_INFORMATION,
-        "WOK_DRILL: App initialised (v1.1.0) — stiffness log + evolved-gas");
+    CFE_EVS_SendEvent(WOK_DRILL_INIT_INF_EID, CFE_EVS_EventType_INFORMATION,
+        "WOK_DRILL: App initialised (v" WOK_VERSION_STRING ") — drilling-response log + evolved-gas");
 
     return CFE_SUCCESS;
 }
@@ -164,7 +184,7 @@ static CFE_Status_t WOK_Drill_Init(void)
 
 static void WOK_Drill_AppendLogRow(void)
 {
-    uint32_t now = WOK_Drill_GetTimeMs();
+    uint32 now = WOK_Drill_GetTimeMs();
 
     if (g_drill.LogRowCount >= WOK_DRILL_LOG_MAX_ROWS) return;
     if (g_drill.LogRowCount > 0 &&
@@ -212,13 +232,13 @@ static void WOK_Drill_WriteLogFile(void)
     snprintf(name, sizeof(name), "drill_%04lu.wok",
              (unsigned long)g_drill.DrillIndex);
 
-    uint32_t size = (uint32_t)(sizeof(*hdr)
-                  + (size_t)g_drill.LogRowCount * sizeof(WOK_Drill_LogRow_t));
+    uint32 size = (uint32)(sizeof(*hdr)
+                + (size_t)g_drill.LogRowCount * sizeof(WOK_Drill_LogRow_t));
 
     if (WOK_HAL_Storage_WriteFile(name, &g_drill.LogFile, size) == WOK_HAL_OK)
     {
         g_drill.LogWritten = 1;
-        CFE_EVS_SendEvent(14, CFE_EVS_EventType_INFORMATION,
+        CFE_EVS_SendEvent(WOK_DRILL_LOG_WRITTEN_EID, CFE_EVS_EventType_INFORMATION,
             "WOK_DRILL: %s — %u rows, site (%.1f,%.1f), final %.1f ppm",
             name, g_drill.LogRowCount,
             (double)g_drill.SiteX_m, (double)g_drill.SiteY_m,
@@ -227,7 +247,7 @@ static void WOK_Drill_WriteLogFile(void)
     else
     {
         g_drill.HkTlm.ErrCounter++;
-        CFE_EVS_SendEvent(14, CFE_EVS_EventType_ERROR,
+        CFE_EVS_SendEvent(WOK_DRILL_LOG_WRITE_ERR_EID, CFE_EVS_EventType_ERROR,
             "WOK_DRILL: Log file write FAILED (%s)", name);
     }
 }
@@ -245,213 +265,238 @@ static void WOK_Drill_ProcessCmd(const CFE_SB_Buffer_t *BufPtr)
     {
         /* ── CC 0: NOOP ──────────────────────────────────────────── */
         case WOK_DRILL_NOOP_CC:
-            g_drill.LastSeqId = ((const WOK_Drill_NoopCmd_t *)BufPtr)->SeqId;
-            g_drill.HkTlm.CmdCounter++;
-            CFE_EVS_SendEvent(2, CFE_EVS_EventType_INFORMATION,
-                "WOK_DRILL: NOOP received");
+            if (WOK_Drill_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Drill_NoopCmd_t)))
+            {
+                g_drill.LastSeqId = ((const WOK_Drill_NoopCmd_t *)BufPtr)->SeqId;
+                g_drill.HkTlm.CmdCounter++;
+                CFE_EVS_SendEvent(WOK_DRILL_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
+                    "WOK_DRILL: NOOP (v" WOK_VERSION_STRING ")");
+            }
             break;
 
         /* ── CC 1: RESET COUNTERS ────────────────────────────────── */
         case WOK_DRILL_RESET_CTRS_CC:
-            g_drill.LastSeqId = ((const WOK_Drill_NoopCmd_t *)BufPtr)->SeqId;
-            g_drill.HkTlm.CmdCounter = 0;
-            g_drill.HkTlm.ErrCounter = 0;
-            CFE_EVS_SendEvent(3, CFE_EVS_EventType_INFORMATION,
-                "WOK_DRILL: Counters reset");
+            if (WOK_Drill_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Drill_ResetCmd_t)))
+            {
+                g_drill.LastSeqId = ((const WOK_Drill_ResetCmd_t *)BufPtr)->SeqId;
+                g_drill.HkTlm.CmdCounter = 0;
+                g_drill.HkTlm.ErrCounter = 0;
+                CFE_EVS_SendEvent(WOK_DRILL_RESET_INF_EID, CFE_EVS_EventType_INFORMATION,
+                    "WOK_DRILL: Counters reset");
+            }
             break;
 
         /* ── CC 2: DEPLOY ARM ────────────────────────────────────── */
         case WOK_DRILL_DEPLOY_ARM_CC:
-        {
-            const WOK_Drill_DeployArmCmd_t *cmd =
-                (const WOK_Drill_DeployArmCmd_t *)BufPtr;
-            g_drill.LastSeqId = cmd->SeqId;
+            if (WOK_Drill_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Drill_DeployArmCmd_t)))
+            {
+                const WOK_Drill_DeployArmCmd_t *cmd =
+                    (const WOK_Drill_DeployArmCmd_t *)BufPtr;
+                g_drill.LastSeqId = cmd->SeqId;
 
-            if (g_drill.AppState != WOK_DRILL_STATE_IDLE &&
-                g_drill.AppState != WOK_DRILL_STATE_FAULT)
-            {
-                g_drill.HkTlm.ErrCounter++;
-                CFE_EVS_SendEvent(0, CFE_EVS_EventType_ERROR,
-                    "WOK_DRILL: DEPLOY_ARM rejected — state %d", g_drill.AppState);
-                break;
-            }
-            float angle = cmd->TargetAngleDeg;
-            if (angle <= 0.0f) angle = WOK_DRILL_DEFAULT_ARM_ANGLE_DEG;
+                if (g_drill.AppState != WOK_DRILL_STATE_IDLE &&
+                    g_drill.AppState != WOK_DRILL_STATE_FAULT)
+                {
+                    g_drill.HkTlm.ErrCounter++;
+                    CFE_EVS_SendEvent(WOK_DRILL_CMD_ERR_EID, CFE_EVS_EventType_ERROR,
+                        "WOK_DRILL: DEPLOY_ARM rejected — state %d", g_drill.AppState);
+                    break;
+                }
+                float angle = cmd->TargetAngleDeg;
+                if (angle <= 0.0f) angle = WOK_DRILL_DEFAULT_ARM_ANGLE_DEG;
 
-            if (WOK_HAL_Drill_DeployArm(angle) == WOK_HAL_OK)
-            {
-                g_drill.PrevState     = g_drill.AppState;
-                g_drill.AppState      = WOK_DRILL_STATE_DEPLOYING;
-                g_drill.ArmCmdStartMs = WOK_Drill_GetTimeMs();
-                g_drill.FaultBitmask &= ~WOK_DRILL_FAULT_ARM_JAM;
-                g_drill.FaultBitmask &= ~WOK_DRILL_FAULT_ARM_TIMEOUT;
-                g_drill.HkTlm.CmdCounter++;
-                CFE_EVS_SendEvent(4, CFE_EVS_EventType_INFORMATION,
-                    "WOK_DRILL: Deploying arm to %.1f deg", (double)angle);
-            }
-            else
-            {
-                g_drill.HkTlm.ErrCounter++;
-                CFE_EVS_SendEvent(0, CFE_EVS_EventType_ERROR,
-                    "WOK_DRILL: HAL DeployArm failed");
+                if (WOK_HAL_Drill_DeployArm(angle) == WOK_HAL_OK)
+                {
+                    g_drill.PrevState     = g_drill.AppState;
+                    g_drill.AppState      = WOK_DRILL_STATE_DEPLOYING;
+                    g_drill.ArmCmdStartMs = WOK_Drill_GetTimeMs();
+                    g_drill.FaultBitmask &= ~WOK_DRILL_FAULT_ARM_JAM;
+                    g_drill.FaultBitmask &= ~WOK_DRILL_FAULT_ARM_TIMEOUT;
+                    g_drill.HkTlm.CmdCounter++;
+                    CFE_EVS_SendEvent(WOK_DRILL_DEPLOY_EID, CFE_EVS_EventType_INFORMATION,
+                        "WOK_DRILL: Deploying arm to %.1f deg", (double)angle);
+                }
+                else
+                {
+                    g_drill.HkTlm.ErrCounter++;
+                    CFE_EVS_SendEvent(WOK_DRILL_HAL_ERR_EID, CFE_EVS_EventType_ERROR,
+                        "WOK_DRILL: HAL DeployArm failed");
+                }
             }
             break;
-        }
 
         /* ── CC 3: STOW ARM ──────────────────────────────────────── */
         case WOK_DRILL_STOW_ARM_CC:
-        {
-            g_drill.LastSeqId = ((const WOK_Drill_NoopCmd_t *)BufPtr)->SeqId;
-            if (WOK_HAL_Drill_StowArm() == WOK_HAL_OK)
+            if (WOK_Drill_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Drill_StowArmCmd_t)))
             {
-                g_drill.PrevState     = g_drill.AppState;
-                g_drill.AppState      = WOK_DRILL_STATE_STOWING;
-                g_drill.ArmCmdStartMs = WOK_Drill_GetTimeMs();
-                g_drill.HkTlm.CmdCounter++;
-                CFE_EVS_SendEvent(5, CFE_EVS_EventType_INFORMATION,
-                    "WOK_DRILL: Stowing arm");
-            }
-            else
-            {
-                g_drill.HkTlm.ErrCounter++;
+                g_drill.LastSeqId = ((const WOK_Drill_StowArmCmd_t *)BufPtr)->SeqId;
+                if (WOK_HAL_Drill_StowArm() == WOK_HAL_OK)
+                {
+                    g_drill.PrevState     = g_drill.AppState;
+                    g_drill.AppState      = WOK_DRILL_STATE_STOWING;
+                    g_drill.ArmCmdStartMs = WOK_Drill_GetTimeMs();
+                    g_drill.HkTlm.CmdCounter++;
+                    CFE_EVS_SendEvent(WOK_DRILL_STOW_EID, CFE_EVS_EventType_INFORMATION,
+                        "WOK_DRILL: Stowing arm");
+                }
+                else
+                {
+                    g_drill.HkTlm.ErrCounter++;
+                    CFE_EVS_SendEvent(WOK_DRILL_HAL_ERR_EID, CFE_EVS_EventType_ERROR,
+                        "WOK_DRILL: HAL StowArm failed");
+                }
             }
             break;
-        }
 
         /* ── CC 4: START DRILL ───────────────────────────────────── */
         case WOK_DRILL_START_DRILL_CC:
-        {
-            const WOK_Drill_StartDrillCmd_t *cmd =
-                (const WOK_Drill_StartDrillCmd_t *)BufPtr;
-            g_drill.LastSeqId = cmd->SeqId;
-
-            if (g_drill.AppState != WOK_DRILL_STATE_ARM_READY)
+            if (WOK_Drill_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Drill_StartDrillCmd_t)))
             {
-                g_drill.HkTlm.ErrCounter++;
-                CFE_EVS_SendEvent(0, CFE_EVS_EventType_ERROR,
-                    "WOK_DRILL: START_DRILL rejected — arm not ready (state %d)",
-                    g_drill.AppState);
-                break;
-            }
-            float depth = cmd->DepthM;
-            float rpm   = cmd->RPM;
+                const WOK_Drill_StartDrillCmd_t *cmd =
+                    (const WOK_Drill_StartDrillCmd_t *)BufPtr;
+                g_drill.LastSeqId = cmd->SeqId;
 
-            /* Clamp to limits */
-            if (depth > g_drill.MaxDepthM) depth = g_drill.MaxDepthM;
-            if (rpm   > g_drill.MaxRPM)    rpm   = g_drill.MaxRPM;
-            if (depth <= 0.0f) depth = 1.0f;
-            if (rpm   <= 0.0f) rpm   = 200.0f;
+                if (g_drill.AppState != WOK_DRILL_STATE_ARM_READY)
+                {
+                    g_drill.HkTlm.ErrCounter++;
+                    CFE_EVS_SendEvent(WOK_DRILL_CMD_ERR_EID, CFE_EVS_EventType_ERROR,
+                        "WOK_DRILL: START_DRILL rejected — arm not ready (state %d)",
+                        g_drill.AppState);
+                    break;
+                }
+                float depth = cmd->DepthM;
+                float rpm   = cmd->RPM;
 
-            /* Site context (rover pose) — stamps this drill cycle's data
-             * products so ground can tie them to the seismic survey. */
-            g_drill.SiteX_m = cmd->SiteX_m;
-            g_drill.SiteY_m = cmd->SiteY_m;
-            WOK_HAL_Drill_SetSite(cmd->SiteX_m, cmd->SiteY_m);
+                /* Clamp to limits */
+                if (depth > g_drill.MaxDepthM) depth = g_drill.MaxDepthM;
+                if (rpm   > g_drill.MaxRPM)    rpm   = g_drill.MaxRPM;
+                if (depth <= 0.0f) depth = 1.0f;
+                if (rpm   <= 0.0f) rpm   = 200.0f;
 
-            /* Open a fresh drill-cycle log */
-            g_drill.LogRowCount  = 0;
-            g_drill.LogWritten   = 0;
-            g_drill.LogLastRowMs = 0;
-            g_drill.LogStartMs   = WOK_Drill_GetTimeMs();
-            g_drill.ROP_mps      = 0.0f;
-            g_drill.PrevDepthM   = 0.0f;
-            g_drill.PrevDepthMs  = 0;
+                /* Site context (rover pose) — stamps this drill cycle's data
+                 * products so ground can tie them to the seismic survey. */
+                g_drill.SiteX_m = cmd->SiteX_m;
+                g_drill.SiteY_m = cmd->SiteY_m;
+                WOK_HAL_Drill_SetSite(cmd->SiteX_m, cmd->SiteY_m);
 
-            if (WOK_HAL_Drill_StartDrill(depth, rpm) == WOK_HAL_OK)
-            {
-                g_drill.PrevState = g_drill.AppState;
-                g_drill.AppState  = WOK_DRILL_STATE_DRILLING;
-                g_drill.FaultBitmask &= ~WOK_DRILL_FAULT_DRILL_STALL;
-                g_drill.FaultBitmask &= ~WOK_DRILL_FAULT_OVER_DEPTH;
-                g_drill.FaultBitmask &= ~WOK_DRILL_FAULT_OVERCURRENT;
-                g_drill.HkTlm.CmdCounter++;
-                CFE_EVS_SendEvent(6, CFE_EVS_EventType_INFORMATION,
-                    "WOK_DRILL: Drilling to %.2fm at %.0f RPM",
-                    (double)depth, (double)rpm);
-            }
-            else
-            {
-                g_drill.HkTlm.ErrCounter++;
+                /* Open a fresh drill-cycle log */
+                g_drill.LogRowCount  = 0;
+                g_drill.LogWritten   = 0;
+                g_drill.LogLastRowMs = 0;
+                g_drill.LogStartMs   = WOK_Drill_GetTimeMs();
+                g_drill.ROP_mps      = 0.0f;
+                g_drill.PrevDepthM   = 0.0f;
+                g_drill.PrevDepthMs  = 0;
+
+                if (WOK_HAL_Drill_StartDrill(depth, rpm) == WOK_HAL_OK)
+                {
+                    g_drill.PrevState = g_drill.AppState;
+                    g_drill.AppState  = WOK_DRILL_STATE_DRILLING;
+                    g_drill.FaultBitmask &= ~WOK_DRILL_FAULT_DRILL_STALL;
+                    g_drill.FaultBitmask &= ~WOK_DRILL_FAULT_OVER_DEPTH;
+                    g_drill.FaultBitmask &= ~WOK_DRILL_FAULT_OVERCURRENT;
+                    g_drill.HkTlm.CmdCounter++;
+                    CFE_EVS_SendEvent(WOK_DRILL_START_DRILL_EID, CFE_EVS_EventType_INFORMATION,
+                        "WOK_DRILL: Drilling to %.2fm at %.0f RPM",
+                        (double)depth, (double)rpm);
+                }
+                else
+                {
+                    g_drill.HkTlm.ErrCounter++;
+                    CFE_EVS_SendEvent(WOK_DRILL_HAL_ERR_EID, CFE_EVS_EventType_ERROR,
+                        "WOK_DRILL: HAL StartDrill failed");
+                }
             }
             break;
-        }
 
         /* ── CC 5: STOP DRILL ────────────────────────────────────── */
         case WOK_DRILL_STOP_DRILL_CC:
-            g_drill.LastSeqId = ((const WOK_Drill_NoopCmd_t *)BufPtr)->SeqId;
-            WOK_HAL_Drill_StopDrill();
-            if (g_drill.AppState == WOK_DRILL_STATE_DRILLING)
+            if (WOK_Drill_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Drill_StopDrillCmd_t)))
             {
-                g_drill.PrevState = g_drill.AppState;
-                g_drill.AppState  = WOK_DRILL_STATE_DRILL_DONE;
+                g_drill.LastSeqId = ((const WOK_Drill_StopDrillCmd_t *)BufPtr)->SeqId;
+                WOK_HAL_Drill_StopDrill();
+                if (g_drill.AppState == WOK_DRILL_STATE_DRILLING)
+                {
+                    g_drill.PrevState = g_drill.AppState;
+                    g_drill.AppState  = WOK_DRILL_STATE_DRILL_DONE;
+                }
+                g_drill.HkTlm.CmdCounter++;
+                CFE_EVS_SendEvent(WOK_DRILL_STOP_DRILL_EID, CFE_EVS_EventType_INFORMATION,
+                    "WOK_DRILL: Drill stopped");
             }
-            g_drill.HkTlm.CmdCounter++;
-            CFE_EVS_SendEvent(7, CFE_EVS_EventType_INFORMATION,
-                "WOK_DRILL: Drill stopped");
             break;
 
         /* ── CC 6: START SAMPLE ──────────────────────────────────── */
         case WOK_DRILL_START_SAMPLE_CC:
-        {
-            const WOK_Drill_StartSampleCmd_t *cmd =
-                (const WOK_Drill_StartSampleCmd_t *)BufPtr;
-            g_drill.LastSeqId = cmd->SeqId;
+            if (WOK_Drill_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Drill_StartSampleCmd_t)))
+            {
+                const WOK_Drill_StartSampleCmd_t *cmd =
+                    (const WOK_Drill_StartSampleCmd_t *)BufPtr;
+                g_drill.LastSeqId = cmd->SeqId;
 
-            if (g_drill.AppState != WOK_DRILL_STATE_DRILL_DONE)
-            {
-                g_drill.HkTlm.ErrCounter++;
-                CFE_EVS_SendEvent(0, CFE_EVS_EventType_ERROR,
-                    "WOK_DRILL: START_SAMPLE rejected — drill not done (state %d)",
-                    g_drill.AppState);
-                break;
-            }
-            uint16_t heat = cmd->HeatSec;
-            uint16_t cool = cmd->CoolSec;
-            if (heat == 0) heat = WOK_DRILL_DEFAULT_HEAT_SEC;
-            if (cool == 0) cool = WOK_DRILL_DEFAULT_COOL_SEC;
+                if (g_drill.AppState != WOK_DRILL_STATE_DRILL_DONE)
+                {
+                    g_drill.HkTlm.ErrCounter++;
+                    CFE_EVS_SendEvent(WOK_DRILL_CMD_ERR_EID, CFE_EVS_EventType_ERROR,
+                        "WOK_DRILL: START_SAMPLE rejected — drill not done (state %d)",
+                        g_drill.AppState);
+                    break;
+                }
+                uint16 heat = cmd->HeatSec;
+                uint16 cool = cmd->CoolSec;
+                if (heat == 0) heat = WOK_DRILL_DEFAULT_HEAT_SEC;
+                if (cool == 0) cool = WOK_DRILL_DEFAULT_COOL_SEC;
 
-            if (WOK_HAL_Drill_StartSample(heat, cool) == WOK_HAL_OK)
-            {
-                g_drill.PrevState = g_drill.AppState;
-                g_drill.AppState  = WOK_DRILL_STATE_SAMPLING;
-                g_drill.FaultBitmask &= ~WOK_DRILL_FAULT_THERMAL_OT;
-                g_drill.HkTlm.CmdCounter++;
-                CFE_EVS_SendEvent(8, CFE_EVS_EventType_INFORMATION,
-                    "WOK_DRILL: Sampling — heat %us, cool %us", heat, cool);
-            }
-            else
-            {
-                g_drill.HkTlm.ErrCounter++;
+                if (WOK_HAL_Drill_StartSample(heat, cool) == WOK_HAL_OK)
+                {
+                    g_drill.PrevState = g_drill.AppState;
+                    g_drill.AppState  = WOK_DRILL_STATE_SAMPLING;
+                    g_drill.FaultBitmask &= ~WOK_DRILL_FAULT_THERMAL_OT;
+                    g_drill.HkTlm.CmdCounter++;
+                    CFE_EVS_SendEvent(WOK_DRILL_START_SAMPLE_EID, CFE_EVS_EventType_INFORMATION,
+                        "WOK_DRILL: Sampling — heat %us, cool %us", heat, cool);
+                }
+                else
+                {
+                    g_drill.HkTlm.ErrCounter++;
+                    CFE_EVS_SendEvent(WOK_DRILL_HAL_ERR_EID, CFE_EVS_EventType_ERROR,
+                        "WOK_DRILL: HAL StartSample failed");
+                }
             }
             break;
-        }
 
         /* ── CC 7: STOP SAMPLE ───────────────────────────────────── */
         case WOK_DRILL_STOP_SAMPLE_CC:
-            g_drill.LastSeqId = ((const WOK_Drill_NoopCmd_t *)BufPtr)->SeqId;
-            WOK_HAL_Drill_StopSample();
-            if (g_drill.AppState == WOK_DRILL_STATE_SAMPLING)
+            if (WOK_Drill_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Drill_StopSampleCmd_t)))
             {
-                g_drill.PrevState = g_drill.AppState;
-                g_drill.AppState  = WOK_DRILL_STATE_SAMPLE_DONE;
+                g_drill.LastSeqId = ((const WOK_Drill_StopSampleCmd_t *)BufPtr)->SeqId;
+                WOK_HAL_Drill_StopSample();
+                if (g_drill.AppState == WOK_DRILL_STATE_SAMPLING)
+                {
+                    g_drill.PrevState = g_drill.AppState;
+                    g_drill.AppState  = WOK_DRILL_STATE_SAMPLE_DONE;
+                }
+                g_drill.HkTlm.CmdCounter++;
             }
-            g_drill.HkTlm.CmdCounter++;
             break;
 
         /* ── CC 8: EMERGENCY STOP ────────────────────────────────── */
         case WOK_DRILL_ESTOP_CC:
-            g_drill.LastSeqId = ((const WOK_Drill_NoopCmd_t *)BufPtr)->SeqId;
-            WOK_HAL_Drill_EmergencyStop();
-            g_drill.PrevState = g_drill.AppState;
-            g_drill.AppState  = WOK_DRILL_STATE_FAULT;
-            g_drill.HkTlm.CmdCounter++;
-            CFE_EVS_SendEvent(9, CFE_EVS_EventType_CRITICAL,
-                "WOK_DRILL: EMERGENCY STOP");
+            if (WOK_Drill_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Drill_EstopCmd_t)))
+            {
+                g_drill.LastSeqId = ((const WOK_Drill_EstopCmd_t *)BufPtr)->SeqId;
+                WOK_HAL_Drill_EmergencyStop();
+                g_drill.PrevState = g_drill.AppState;
+                g_drill.AppState  = WOK_DRILL_STATE_FAULT;
+                g_drill.HkTlm.CmdCounter++;
+                CFE_EVS_SendEvent(WOK_DRILL_ESTOP_EID, CFE_EVS_EventType_CRITICAL,
+                    "WOK_DRILL: EMERGENCY STOP");
+            }
             break;
 
         default:
             g_drill.HkTlm.ErrCounter++;
-            CFE_EVS_SendEvent(0, CFE_EVS_EventType_ERROR,
+            CFE_EVS_SendEvent(WOK_DRILL_CMD_ERR_EID, CFE_EVS_EventType_ERROR,
                 "WOK_DRILL: Unknown command code %d", CmdCode);
             break;
     }
@@ -513,8 +558,8 @@ static void WOK_Drill_UpdateStatus(void)
     /* ROP: smoothed depth rate while drilling */
     if (g_drill.AppState == WOK_DRILL_STATE_DRILLING)
     {
-        uint32_t now  = WOK_Drill_GetTimeMs();
-        uint32_t dt   = now - g_drill.PrevDepthMs;
+        uint32 now  = WOK_Drill_GetTimeMs();
+        uint32 dt   = now - g_drill.PrevDepthMs;
         if (g_drill.PrevDepthMs != 0 && dt > 0)
         {
             float inst = (s->DrillDepthM - g_drill.PrevDepthM) * 1000.0f / (float)dt;
@@ -551,7 +596,7 @@ static void WOK_Drill_UpdateStatus(void)
     {
         g_drill.PrevState = g_drill.AppState;
         g_drill.AppState  = WOK_DRILL_STATE_ARM_READY;
-        CFE_EVS_SendEvent(10, CFE_EVS_EventType_INFORMATION,
+        CFE_EVS_SendEvent(WOK_DRILL_ARM_READY_EID, CFE_EVS_EventType_INFORMATION,
             "WOK_DRILL: Arm deployed — ready");
     }
 
@@ -561,7 +606,7 @@ static void WOK_Drill_UpdateStatus(void)
     {
         g_drill.PrevState = g_drill.AppState;
         g_drill.AppState  = WOK_DRILL_STATE_DRILL_DONE;
-        CFE_EVS_SendEvent(11, CFE_EVS_EventType_INFORMATION,
+        CFE_EVS_SendEvent(WOK_DRILL_DRILL_DONE_EID, CFE_EVS_EventType_INFORMATION,
             "WOK_DRILL: Drill complete — depth %.2fm", (double)s->DrillDepthM);
     }
 
@@ -580,7 +625,7 @@ static void WOK_Drill_UpdateStatus(void)
         else
             s->SampleQuality = 3; /* bad / no detection */
 
-        CFE_EVS_SendEvent(12, CFE_EVS_EventType_INFORMATION,
+        CFE_EVS_SendEvent(WOK_DRILL_SAMPLE_DONE_EID, CFE_EVS_EventType_INFORMATION,
             "WOK_DRILL: Sample complete — %.1f ppm H2O, quality %d",
             (double)s->VolatileConcPpm, s->SampleQuality);
 
@@ -594,7 +639,7 @@ static void WOK_Drill_UpdateStatus(void)
     {
         g_drill.PrevState = g_drill.AppState;
         g_drill.AppState  = WOK_DRILL_STATE_IDLE;
-        CFE_EVS_SendEvent(13, CFE_EVS_EventType_INFORMATION,
+        CFE_EVS_SendEvent(WOK_DRILL_STOWED_EID, CFE_EVS_EventType_INFORMATION,
             "WOK_DRILL: Arm stowed — IDLE");
 
         /* Drill-without-sample cycles still get their log archived */
@@ -609,17 +654,17 @@ static void WOK_Drill_UpdateStatus(void)
 static void WOK_Drill_RunFaultDetection(void)
 {
     WOK_Drill_StatusTlm_t *s = &g_drill.StatusTlm;
-    uint16_t new_faults = 0;
+    uint16 new_faults = 0;
 
     /* ── Arm timeout ─────────────────────────────────────────────── */
     if (g_drill.AppState == WOK_DRILL_STATE_DEPLOYING ||
         g_drill.AppState == WOK_DRILL_STATE_STOWING)
     {
-        uint32_t elapsed = WOK_Drill_GetTimeMs() - g_drill.ArmCmdStartMs;
+        uint32 elapsed = WOK_Drill_GetTimeMs() - g_drill.ArmCmdStartMs;
         if (elapsed > g_drill.ArmTimeoutMs)
         {
             new_faults |= WOK_DRILL_FAULT_ARM_TIMEOUT;
-            CFE_EVS_SendEvent(20, CFE_EVS_EventType_ERROR,
+            CFE_EVS_SendEvent(WOK_DRILL_FAULT_ARM_TIMEOUT_EID, CFE_EVS_EventType_ERROR,
                 "WOK_DRILL: FAULT — arm timeout (%lu ms)", (unsigned long)elapsed);
         }
     }
@@ -630,7 +675,7 @@ static void WOK_Drill_RunFaultDetection(void)
         if (s->DrillCurrentAmps > g_drill.CurrentLimitA)
         {
             new_faults |= WOK_DRILL_FAULT_OVERCURRENT;
-            CFE_EVS_SendEvent(21, CFE_EVS_EventType_ERROR,
+            CFE_EVS_SendEvent(WOK_DRILL_FAULT_OVERCUR_EID, CFE_EVS_EventType_ERROR,
                 "WOK_DRILL: FAULT — drill overcurrent %.2fA (limit %.2fA)",
                 (double)s->DrillCurrentAmps, (double)g_drill.CurrentLimitA);
         }
@@ -639,7 +684,7 @@ static void WOK_Drill_RunFaultDetection(void)
         if (s->DrillTorqueNm > g_drill.TorqueLimitNm)
         {
             new_faults |= WOK_DRILL_FAULT_DRILL_STALL;
-            CFE_EVS_SendEvent(22, CFE_EVS_EventType_ERROR,
+            CFE_EVS_SendEvent(WOK_DRILL_FAULT_STALL_EID, CFE_EVS_EventType_ERROR,
                 "WOK_DRILL: FAULT — drill stall torque %.2f Nm (limit %.2f)",
                 (double)s->DrillTorqueNm, (double)g_drill.TorqueLimitNm);
         }
@@ -649,7 +694,7 @@ static void WOK_Drill_RunFaultDetection(void)
         {
             new_faults |= WOK_DRILL_FAULT_OVER_DEPTH;
             WOK_HAL_Drill_StopDrill();
-            CFE_EVS_SendEvent(23, CFE_EVS_EventType_ERROR,
+            CFE_EVS_SendEvent(WOK_DRILL_FAULT_OVER_DEPTH_EID, CFE_EVS_EventType_ERROR,
                 "WOK_DRILL: FAULT — over-depth %.2fm (limit %.2f)",
                 (double)s->DrillDepthM, (double)g_drill.MaxDepthM);
         }
@@ -662,7 +707,7 @@ static void WOK_Drill_RunFaultDetection(void)
         {
             new_faults |= WOK_DRILL_FAULT_THERMAL_OT;
             WOK_HAL_Drill_StopSample();
-            CFE_EVS_SendEvent(24, CFE_EVS_EventType_ERROR,
+            CFE_EVS_SendEvent(WOK_DRILL_FAULT_THERMAL_EID, CFE_EVS_EventType_ERROR,
                 "WOK_DRILL: FAULT — thermal overtemp %.1fC (limit %.1f)",
                 (double)s->CellTempC, (double)g_drill.MaxCellTempC);
         }
@@ -679,7 +724,7 @@ static void WOK_Drill_RunFaultDetection(void)
             WOK_HAL_Drill_EmergencyStop();
             g_drill.PrevState = g_drill.AppState;
             g_drill.AppState  = WOK_DRILL_STATE_FAULT;
-            CFE_EVS_SendEvent(25, CFE_EVS_EventType_CRITICAL,
+            CFE_EVS_SendEvent(WOK_DRILL_FAULT_ENTRY_EID, CFE_EVS_EventType_CRITICAL,
                 "WOK_DRILL: Entering FAULT — bitmask 0x%04X",
                 g_drill.FaultBitmask);
         }
@@ -687,14 +732,34 @@ static void WOK_Drill_RunFaultDetection(void)
 }
 
 /* ════════════════════════════════════════════════════════════════════
+** Command length check — rejects any command whose SB length differs
+** from the expected struct size (counts the error, sends one event)
+** ════════════════════════════════════════════════════════════════════ */
+
+bool WOK_Drill_VerifyCmdLength(const CFE_MSG_Message_t *MsgPtr, size_t ExpectedLength)
+{
+    size_t ActualLength = 0;
+    CFE_MSG_GetSize(MsgPtr, &ActualLength);
+    if (ActualLength != ExpectedLength)
+    {
+        g_drill.HkTlm.ErrCounter++;
+        CFE_EVS_SendEvent(WOK_DRILL_LEN_ERR_EID, CFE_EVS_EventType_ERROR,
+            "WOK_DRILL: Len err: exp %lu got %lu",
+            (unsigned long)ExpectedLength, (unsigned long)ActualLength);
+        return false;
+    }
+    return true;
+}
+
+/* ════════════════════════════════════════════════════════════════════
 ** Utility: millisecond timestamp from cFE TIME
 ** ════════════════════════════════════════════════════════════════════ */
 
-static uint32_t WOK_Drill_GetTimeMs(void)
+static uint32 WOK_Drill_GetTimeMs(void)
 {
     CFE_TIME_SysTime_t t = CFE_TIME_GetTime();
     /* Promote the *1000 to uint64 so it doesn't overflow at ~49d uptime
      * before the final uint32 truncation. uint32 wrap of the result is
      * fine — callers only use delta = end - start (modular arithmetic). */
-    return (uint32_t)((uint64_t)t.Seconds * 1000ull + t.Subseconds / 4294967u);
+    return (uint32)((uint64)t.Seconds * 1000ull + t.Subseconds / 4294967u);
 }

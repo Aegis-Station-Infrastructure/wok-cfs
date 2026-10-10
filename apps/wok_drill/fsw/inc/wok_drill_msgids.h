@@ -3,23 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 /*
-** WOK Drill Message IDs and Types
-** Follows the mission pattern: CMD at 0x18Dx, TLM at 0x08Dx
-** (base MIDs live in wok_common/msgs/inc/wok_msgids.h)
+** WOK Drill — Message Definitions (command codes, commands, telemetry,
+** drill log file layout). The DRILL MIDs themselves live with the rest
+** of the mission's MIDs in wok_common/msgs/inc/wok_msgids.h.
 */
 
 #ifndef WOK_DRILL_MSGIDS_H
 #define WOK_DRILL_MSGIDS_H
 
-#include "cfe_sb.h"
-
-/* ── Command MIDs ────────────────────────────────────────────────── */
-#define WOK_DRILL_CMD_MID         0x18DA   /* Ground/SEQ → DRILL commands  */
-#define WOK_DRILL_SEND_HK_MID    0x18DB   /* SCH_LAB → DRILL HK wakeup   */
-
-/* ── Telemetry MIDs ──────────────────────────────────────────────── */
-#define WOK_DRILL_HK_TLM_MID     0x08DA   /* DRILL HK telemetry (28 bytes) */
-#define WOK_DRILL_STATUS_TLM_MID 0x08DB   /* DRILL status telemetry (48 bytes) */
+#include "cfe.h"
+#include "wok_msgids.h"
 
 /* ── Command Codes ───────────────────────────────────────────────── */
 #define WOK_DRILL_NOOP_CC          0
@@ -54,58 +47,65 @@
 /* ── Telemetry Structures ────────────────────────────────────────── */
 
 /*
-** DRILL HK Telemetry (MID 0x08DA, 28 bytes payload after 16-byte CCSDS header)
+** DRILL HK Telemetry (WOK_DRILL_HK_TLM_MID, 20-byte payload after the
+** 16-byte telemetry header; 36 bytes total)
 */
 typedef struct
 {
     CFE_MSG_TelemetryHeader_t TelemetryHeader;
 
-    uint16_t CmdCounter;
-    uint16_t ErrCounter;
-    uint8_t  AppState;        /* WOK_DRILL_STATE_* */
-    uint8_t  PrevState;
-    uint16_t FaultBitmask;
-    uint16_t SeqId;              /* Echo of last cmd SeqId */
-    uint16_t SpareSeq;
+    uint16 CmdCounter;
+    uint16 ErrCounter;
+    uint8  AppState;        /* WOK_DRILL_STATE_* */
+    uint8  PrevState;
+    uint16 FaultBitmask;
+    uint16 SeqId;              /* Echo of last cmd SeqId */
+    uint16 SpareSeq;
     float    ArmAngleDeg;
     float    DrillDepthM;
 
 } WOK_Drill_HkTlm_t;
 
 /*
-** DRILL Status Telemetry (MID 0x08DB, 48 bytes payload after 16-byte CCSDS header)
+** DRILL Status Telemetry (WOK_DRILL_STATUS_TLM_MID, 56-byte payload after
+** the 16-byte telemetry header; 72 bytes total)
 */
 typedef struct
 {
     CFE_MSG_TelemetryHeader_t TelemetryHeader;
 
     /* Arm */
-    uint8_t  ArmHalState;     /* WOK_HAL_DRILL_ARM_* */
-    uint8_t  Spare1[3];
+    uint8  ArmHalState;     /* WOK_HAL_DRILL_ARM_* */
+    uint8  Spare1[3];
     float    ArmAngleDeg;
     float    ArmCurrentAmps;
 
     /* Drill motor */
-    uint8_t  DrillHalState;   /* WOK_HAL_DRILL_MOTOR_* */
-    uint8_t  Spare2[3];
+    uint8  DrillHalState;   /* WOK_HAL_DRILL_MOTOR_* */
+    uint8  Spare2[3];
     float    DrillDepthM;
     float    DrillRPM;
     float    DrillTorqueNm;
     float    DrillCurrentAmps;
 
     /* Thermal / sampling */
-    uint8_t  SampleHalState;  /* WOK_HAL_DRILL_SAMPLE_* */
-    uint8_t  SampleQuality;   /* 0=no data, 1=good, 2=marginal, 3=bad */
-    uint8_t  Spare3[2];
+    uint8  SampleHalState;  /* WOK_HAL_DRILL_SAMPLE_* */
+    uint8  SampleQuality;   /* 0=no data, 1=good, 2=marginal, 3=bad */
+    uint8  Spare3[2];
     float    CellTempC;
     float    VaporPressurePa;
     float    VolatileConcPpm;
 
-    /* Stiffness-log channels (appended v1.1 — prefix decoders unaffected) */
+    /* Stiffness-log channels (appended — prefix decoders unaffected) */
     float    WOB_N;           /* weight-on-bit, Newtons               */
     float    ROP_mps;         /* smoothed rate of penetration, m/s    */
 
 } WOK_Drill_StatusTlm_t;
+
+/* Ground decoders unpack these at fixed offsets — catch layout drift at
+ * compile time. */
+CompileTimeAssert(sizeof(WOK_Drill_HkTlm_t)     == 36, WOK_Drill_HkTlm_t_WrongSize);
+CompileTimeAssert(sizeof(WOK_Drill_StatusTlm_t) == 72, WOK_Drill_StatusTlm_t_WrongSize);
 
 /* ================================================================== */
 /*  Drill log file (per drill cycle: penetration + evolved-gas record) */
@@ -116,7 +116,7 @@ typedef struct
 /*  SAMPLING. The (CellTempC, VolatilePpm) columns during heating form */
 /*  the evolved-gas curve — the binding-classification measurement.   */
 /*  The (DepthM, WOB, Torque, ROP-by-differencing) columns form the   */
-/*  regolith stiffness log. All little-endian, 4-byte aligned.        */
+/*  regolith drilling-response log. All little-endian, 4-byte aligned.        */
 /* ================================================================== */
 #define WOK_DRILL_FILE_MAGIC    0x4452494C   /* 'DRIL' */
 #define WOK_DRILL_FILE_VERSION  1
@@ -124,26 +124,26 @@ typedef struct
 
 typedef struct
 {
-    uint32_t Magic;
-    uint16_t Version;
-    uint16_t RowSize;         /* sizeof(WOK_Drill_LogRow_t)           */
-    uint16_t RowCount;
-    uint16_t SeqId;           /* correlation at START_DRILL           */
+    uint32 Magic;
+    uint16 Version;
+    uint16 RowSize;         /* sizeof(WOK_Drill_LogRow_t)           */
+    uint16 RowCount;
+    uint16 SeqId;           /* correlation at START_DRILL           */
     float    SiteX_m;         /* rover pose, mission start frame      */
     float    SiteY_m;
     float    TargetDepthM;
     float    RPM;
-    uint16_t HeatSec;
-    uint16_t CoolSec;
-    uint32_t DrillIndex;      /* monotonic drill-cycle counter        */
-    uint32_t Spare;
+    uint16 HeatSec;
+    uint16 CoolSec;
+    uint32 DrillIndex;      /* monotonic drill-cycle counter        */
+    uint32 Spare;
 } WOK_Drill_LogFileHeader_t;
 
 typedef struct
 {
-    uint32_t T_ms;            /* ms since drill cycle start           */
-    uint8_t  Phase;           /* WOK_DRILL_STATE_* at sample time     */
-    uint8_t  Spare[3];
+    uint32 T_ms;            /* ms since drill cycle start           */
+    uint8  Phase;           /* WOK_DRILL_STATE_* at sample time     */
+    uint8  Spare[3];
     float    DepthM;
     float    WOB_N;
     float    TorqueNm;
@@ -153,14 +153,17 @@ typedef struct
     float    VolatileConcPpm;
 } WOK_Drill_LogRow_t;
 
+CompileTimeAssert(sizeof(WOK_Drill_LogFileHeader_t) == 40, WOK_Drill_LogFileHeader_t_WrongSize);
+CompileTimeAssert(sizeof(WOK_Drill_LogRow_t)        == 36, WOK_Drill_LogRow_t_WrongSize);
+
 /* ── Command Structures ──────────────────────────────────────────── */
 
 /* CC 0: NOOP — no payload */
 typedef struct
 {
     CFE_MSG_CommandHeader_t CmdHeader;
-    uint16_t SeqId;              /* Sequencer correlation ID (0=ground) */
-    uint16_t SpareSeq;
+    uint16 SeqId;              /* Sequencer correlation ID (0=ground) */
+    uint16 SpareSeq;
 } WOK_Drill_NoopCmd_t;
 
 /* CC 1: RESET_CTRS — no payload */
@@ -170,8 +173,8 @@ typedef WOK_Drill_NoopCmd_t WOK_Drill_ResetCmd_t;
 typedef struct
 {
     CFE_MSG_CommandHeader_t CmdHeader;
-    uint16_t SeqId;              /* Sequencer correlation ID (0=ground) */
-    uint16_t SpareSeq;
+    uint16 SeqId;              /* Sequencer correlation ID (0=ground) */
+    uint16 SpareSeq;
     float TargetAngleDeg;
 } WOK_Drill_DeployArmCmd_t;
 
@@ -182,8 +185,8 @@ typedef WOK_Drill_NoopCmd_t WOK_Drill_StowArmCmd_t;
 typedef struct
 {
     CFE_MSG_CommandHeader_t CmdHeader;
-    uint16_t SeqId;              /* Sequencer correlation ID (0=ground) */
-    uint16_t SpareSeq;
+    uint16 SeqId;              /* Sequencer correlation ID (0=ground) */
+    uint16 SpareSeq;
     float DepthM;
     float RPM;
     float SiteX_m;               /* Rover pose at site (start frame) —   */
@@ -197,10 +200,10 @@ typedef WOK_Drill_NoopCmd_t WOK_Drill_StopDrillCmd_t;
 typedef struct
 {
     CFE_MSG_CommandHeader_t CmdHeader;
-    uint16_t SeqId;              /* Sequencer correlation ID (0=ground) */
-    uint16_t SpareSeq;
-    uint16_t HeatSec;
-    uint16_t CoolSec;
+    uint16 SeqId;              /* Sequencer correlation ID (0=ground) */
+    uint16 SpareSeq;
+    uint16 HeatSec;
+    uint16 CoolSec;
 } WOK_Drill_StartSampleCmd_t;
 
 /* CC 7: STOP_SAMPLE — no payload */

@@ -6,9 +6,21 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>WOK Ground Control</title>
-  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Single-file dashboard by design: React + Babel are loaded from a
+       CDN and the JSX below is compiled in the browser, so the page needs
+       internet access on first load (the browser caches the three scripts
+       afterwards). Versions are pinned and integrity-checked; to bump a
+       version, refetch the file and recompute
+         openssl dgst -sha384 -binary FILE | openssl base64 -A -->
+  <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"
+          integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z"
+          crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"
+          integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1"
+          crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.26.10/babel.min.js"
+          integrity="sha384-BcI7nduYchENm39cFMEVJXHEE7fwHONANyn/pY2YTa+BNtrWF2bKBZeI0wqVithi"
+          crossorigin="anonymous"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: #010409; }
@@ -21,7 +33,10 @@
 
     // ─── CONFIG ────────────────────────────────────────────────────────────
     // Bridge runs on the same host that serves this page (wok_sim.sh).
-    const WS_URL = `ws://${window.location.hostname || "127.0.0.1"}:8765`;
+    // The bridge port defaults to 8765; override with ?ws=<port> in the
+    // page URL (wok_sim.sh prints the right URL when WOK_WS_PORT is set).
+    const WS_PORT = parseInt(new URLSearchParams(window.location.search).get("ws"), 10) || 8765;
+    const WS_URL = `ws://${window.location.hostname || "127.0.0.1"}:${WS_PORT}`;
     const RECONNECT_INTERVAL = 3000;
 
     // ─── STATE MACHINE DEFINITIONS ─────────────────────────────────────────
@@ -635,13 +650,13 @@
               <TlmValue label="Sample Rate" value={seisStatus.sample_rate_hz ?? "--"} unit="Hz" />
               <TlmValue label="Samples" value={seisStatus.samples_collected != null ? seisStatus.samples_collected.toLocaleString() : "--"} />
               <TlmValue label="Src Mode" value={seisStatus.source_mode ?? "--"} />
-              <TlmValue label="Src State" value={seisStatus.thumper_state ?? "--"}
-                warn={seisStatus.thumper_state === "CHARGING" || seisStatus.thumper_state === "SWEEPING"} />
+              <TlmValue label="Src State" value={seisStatus.source_state ?? "--"}
+                warn={seisStatus.source_state === "CHARGING" || seisStatus.source_state === "SWEEPING"} />
               <TlmValue label="Bank" value={
                 seisStatus.bank_v != null
                   ? `${seisStatus.bank_v}V / ${seisStatus.bank_soc_pct}%` : "--"
               } />
-              <TlmValue label="Force" value={seisStatus.thumper_force_n ?? "--"} unit="N" />
+              <TlmValue label="Force" value={seisStatus.source_force_n ?? "--"} unit="N" />
               {seisStatus.source_mode === "SWEEP" && (
                 <TlmValue label="Sweep/Corr" value={
                   seisStatus.sweep_progress_pct != null
@@ -742,7 +757,7 @@
             display: "flex", justifyContent: "space-between",
             fontSize: 9, color: "#30363d", fontFamily: "'JetBrains Mono', monospace",
           }}>
-            <span>WOK Ground Control v2.0 · cFS Draco v7.0.0 · WebSocket Bridge · 6 Apps</span>
+            <span>WOK Ground Control · cFS Draco v7.0.0 · WebSocket Bridge · 6 Apps</span>
             <span>{WS_URL} · CI_LAB :1234 · TO_LAB :2234</span>
           </footer>
         </div>

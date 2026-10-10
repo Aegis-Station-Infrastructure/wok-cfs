@@ -25,8 +25,7 @@
 **   WOK_SRC_MIN_CHARGE_BATT_V — an arm left charging then never reaches
 **   ARMED and the sequencer's arm timeout fires). Firing dumps the bank,
 **   so stacked shots recharge between strikes. Impulse plate force
-**   scales with sqrt(bank energy); the 50 J default reproduces the v4.0
-**   drop-weight amplitude.
+**   scales with sqrt(bank energy): ~8.5 kN at the 50 J default.
 ** Evaluate: derived from the geology model at the configured site —
 **   deterministic per site, consistent with the drill sim.
 ** Coupling (WOK_SIM_COUPLING=1, default OFF): per-pod and plate
@@ -58,23 +57,32 @@
 
 /* ── Synthetic waveform parameters ───────────────────────────────── */
 #define SIM_NOISE_COUNTS      80.0f   /* background noise amplitude     */
-#define SIM_WAVELET_F0_HZ     25.0f   /* impulse P wavelet centre freq  */
-#define SIM_WAVELET_TAU_S      0.15f  /* impulse wavelet decay constant */
-#define SIM_AMP_COUNTS_N   40000.0f   /* counts per Newton at 1 m       */
+/* Impulse response: a causal damped sine. 400 Hz / 12 ms gives a ~0.6 m
+ * wavelength at v1 = 250 m/s, short against the 1.5 m layer and the
+ * 1.5-6 m spread, and sits inside the 100-1600 Hz band the sweep mode
+ * uses. The onset is a step at t_arr by construction (see Sim Model Spec
+ * §3 and §11). */
+#define SIM_WAVELET_F0_HZ    400.0f   /* impulse P wavelet centre freq  */
+#define SIM_WAVELET_TAU_S      0.012f /* impulse wavelet decay constant */
+#define SIM_AMP_COUNTS_N      40.0f   /* counts per Newton at 1 m       */
 #define SIM_CHUNK_MAX       1000u     /* samples/chan per GetSamples call */
 
 /* ── EM source model ─────────────────────────────────────────────── */
-#define SIM_BANK_CHARGE_W     50.0f   /* charger power (50 J default -> 1 s,
-                                         matching the v4.0 1 s arm time) */
+#define SIM_BANK_CHARGE_W     50.0f   /* charger power: 50 J default -> 1 s
+                                         arm time (the sequencer's arm
+                                         timeout is set against this) */
 #define SIM_BANK_CAP_F         2.5e-3f /* bank capacitance: 200 J = 400 V */
-#define SIM_IMPULSE_REF_N      8.5f   /* plate force at the 50 J default */
+#define SIM_IMPULSE_REF_N   8500.0f   /* peak plate force at the 50 J
+                                         default: ~7 N.s impulse over a
+                                         ~1 ms strike (kN-class, as for
+                                         any hammer/plate source) */
 /* Regulated (force-limited) sweep drive. Weak by design — per-shot
  * arrivals sit at/below the noise floor and only emerge in the
  * correlation (the physical point of sweep mode). Also keeps the
  * correlated SNR moderate so the onset picker's threshold crossing
  * stays on the Klauder main lobe (harness-tuned with
  * WOK_SEIS_CORR_LEAD_FRAC / the pilot taper). */
-#define SIM_SWEEP_FORCE_N      0.02f
+#define SIM_SWEEP_FORCE_N     20.0f
 #define SIM_SWEEP_DRIVE_W     10.0f   /* bank energy per second of sweep */
 
 static const float SIM_POD_OFFSETS_M[WOK_SEIS_MAX_CHANNELS] =
@@ -593,11 +601,11 @@ int32_t WOK_HAL_Src_Fire(void)
     else
     {
         /* Cap discharge -> single strike. Plate force scales with the
-         * stored energy (impulse ~ sqrt(E)); the 50 J default reproduces
-         * the v4.0 drop-weight's 8.5-9.5 N. */
+         * stored energy (impulse ~ sqrt(E)): 8.5-9.5 kN at the 50 J
+         * default, with ~10% shot-to-shot jitter. */
         g_src.last_force_n = SIM_IMPULSE_REF_N
                            * sqrtf(g_src.bank_j / WOK_SRC_DEFAULT_ENERGY_J)
-                           + (float)(rand() % 100) / 100.0f;
+                           + (float)(rand() % 1000);
         g_src.bank_j *= 0.02f;              /* discharged into the plate */
         g_src.state   = WOK_HAL_SRC_FIRED;
     }

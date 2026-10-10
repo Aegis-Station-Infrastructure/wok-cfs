@@ -119,4 +119,9 @@ typedef struct
     uint16  SpareR;
 } WOK_Nav_StatusTlm_t;
 
+/* Ground decoders unpack these at fixed offsets — catch layout drift at
+ * compile time (sizes include the 16-byte telemetry header). */
+CompileTimeAssert(sizeof(WOK_Nav_HkTlm_t)     == 24, WOK_Nav_HkTlm_t_WrongSize);
+CompileTimeAssert(sizeof(WOK_Nav_StatusTlm_t) == 48, WOK_Nav_StatusTlm_t_WrongSize);
+
 #endif /* WOK_NAV_MSG_H */

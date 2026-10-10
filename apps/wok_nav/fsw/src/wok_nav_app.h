@@ -55,6 +55,7 @@ typedef enum {
 typedef struct
 {
     CFE_SB_PipeId_t      CmdPipe;
+    uint32               RunStatus;
     WOK_Nav_HkTlm_t      HkTlm;
     WOK_Nav_StatusTlm_t  StatusTlm;
 
@@ -94,8 +95,8 @@ typedef struct
 
     /* Stuck detection */
     float    LastProgress;       /* distance/heading at last check    */
-    uint32_t StuckLastTickMs;    /* timestamp of last progress sample */
-    uint32_t SubStateStartMs;    /* timestamp sub-state was entered   */
+    uint32 StuckLastTickMs;    /* timestamp of last progress sample */
+    uint32 SubStateStartMs;    /* timestamp sub-state was entered   */
 
     /* Config (could go to TBL later — for now from wok_platform_cfg.h) */
     float  MaxSpeed_mps;

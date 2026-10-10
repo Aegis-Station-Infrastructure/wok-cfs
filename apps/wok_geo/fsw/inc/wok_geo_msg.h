@@ -113,4 +113,9 @@ typedef struct
     uint8   SpareP;
 } WOK_Geo_StatusTlm_t;
 
+/* Ground decoders unpack these at fixed offsets — catch layout drift at
+ * compile time (sizes include the 16-byte telemetry header). */
+CompileTimeAssert(sizeof(WOK_Geo_HkTlm_t)     == 24, WOK_Geo_HkTlm_t_WrongSize);
+CompileTimeAssert(sizeof(WOK_Geo_StatusTlm_t) == 60, WOK_Geo_StatusTlm_t_WrongSize);
+
 #endif /* WOK_GEO_MSG_H */

@@ -58,12 +58,17 @@ float WOK_SimGeology_FirstArrivalSec(float x_m, float y_m, float offset_m);
 
 /* Cumulative fraction (0-1) of the material's total volatiles evolved
  * by the time the vaporization cell reaches temp_c. The release
- * spectrum encodes HOW the water is bound — the commercially critical
- * distinction:
- *   adsorbed film   ~110 C  (background hydration everywhere)
- *   pore ice        ~160 C  (85% of lens-derived ice)
+ * spectrum encodes HOW the water is bound — the operationally important
+ * distinction, in order of binding energy:
+ *   pore ice        ~100 C  (85% of lens-derived ice; free water, lost
+ *                            around the boiling point at cell pressure)
+ *   adsorbed film   ~160 C  (background hydration everywhere)
  *   hydrated mineral ~320 C (15% of lens ice; incompletely released
  *                            at the 300 C cell limit — intentional)
+ * The sim cell is sealed and starts at bench ambient (25 C), so nothing
+ * is lost before the ramp. A vented flight cell would lose free ice
+ * below 0 C during warm-up: cold-loading and sealing before the ramp is
+ * a flight requirement, not a sim detail.
  * Ground classifies binding from the (T, ppm) curve in the drill log. */
 float WOK_SimGeology_EvolvedFraction(float x_m, float y_m, float depth_m,
                                      float temp_c);

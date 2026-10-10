@@ -25,9 +25,9 @@
 **   ./harness hal   — end-to-end through the real sim HAL (wall-clock
 **                     acquisitions): 3-shot impulse stack picks vs 3-shot
 **                     sweep correlated stack picks at two sites; the
-**                     +-0.5 ms agreement gate (verification req 1).
+**                     +-0.5 ms agreement gate (pick-agreement gate).
 **   ./harness bank  — bank model: charge timing, deplete/recharge across
-**                     stacked shots, low-battery arm stall (req 4).
+**                     stacked shots, low-battery arm stall (low-battery arm gate).
 **   ./harness coupling — CP-1 coupling truth model: determinism, seat
 **                     statistics (reseat must improve a bad seat), the
 **                     seating-force proxy correlation + false-accept
@@ -73,7 +73,7 @@ static const float PODS[NCH] = WOK_SEIS_POD_OFFSETS_M_INIT;
 /* Tunables (overridable from argv in tune mode) */
 static float g_lead_frac = WOK_SEIS_CORR_LEAD_FRAC;
 static float g_corr_gain = WOK_SEIS_CORR_GAIN;
-static float g_swp_force = 0.02f;   /* = SIM_SWEEP_FORCE_N */
+static float g_swp_force = 20.0f;   /* = SIM_SWEEP_FORCE_N */
 
 /* ================= app-chain replicas (mirror wok_seis_app.c) ======= */
 
@@ -189,19 +189,19 @@ static float synth(int mode, float site_x, float site_y, int ch,
         float dt    = t - (t0 + t_arr);
         if (dt >= 0.0f)
         {
-            float amp = force * 40000.0f / (off * off + 1.0f);
+            float amp = force * 40.0f / (off * off + 1.0f);  /* = SIM_AMP_COUNTS_N */
             if (mode == WOK_HAL_SRC_MODE_SWEEP)
                 val += amp * WOK_HAL_Src_PilotSample(dt, f0, f1, dur);
             else
-                val += amp * expf(-dt / 0.15f)
-                           * sinf(2.0f * 3.14159265f * 25.0f * dt);
+                val += amp * expf(-dt / 0.012f)          /* = SIM_WAVELET_TAU_S */
+                           * sinf(2.0f * 3.14159265f * 400.0f * dt); /* = SIM_WAVELET_F0_HZ */
         }
     }
     return val;
 }
 
 #define SYN_DUR_S   10
-#define SYN_COUNT   ((uint32_t)(SYN_DUR_S * FS))
+#define SYN_COUNT   (SYN_DUR_S * 4000u)        /* = SYN_DUR_S * FS, integer for the array bound */
 #define SYN_STRIKE  ((uint32_t)(2.0f * FS))
 
 static int32_t g_trace[SYN_COUNT * NCH];
@@ -266,11 +266,11 @@ static int do_tune(void)
            (double)WOK_SRC_DEFAULT_SWEEP_DUR_S);
     int pass = 1;
     /* Dry site + lens site (the two geology regimes) */
-    pass &= tune_site(0.0f, 0.0f, 3, 9.0f, g_swp_force,
+    pass &= tune_site(0.0f, 0.0f, 3, 9000.0f, g_swp_force,
                       WOK_SRC_DEFAULT_SWEEP_F0_HZ,
                       WOK_SRC_DEFAULT_SWEEP_F1_HZ,
                       WOK_SRC_DEFAULT_SWEEP_DUR_S);
-    pass &= tune_site(6.0f, 3.0f, 3, 9.0f, g_swp_force,
+    pass &= tune_site(6.0f, 3.0f, 3, 9000.0f, g_swp_force,
                       WOK_SRC_DEFAULT_SWEEP_F0_HZ,
                       WOK_SRC_DEFAULT_SWEEP_F1_HZ,
                       WOK_SRC_DEFAULT_SWEEP_DUR_S);

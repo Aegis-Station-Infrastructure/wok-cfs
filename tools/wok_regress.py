@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Aegis Station Infrastructure LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Regression compare: v4.0 baseline mission vs v5.0 impulse mission.
+"""Regression compare: drop-weight (pre-5.0) baseline mission vs the EM-source mission.
 
 Usage: wok_regress.py <baseline_log> <new_log> <baseline_products> <new_products>
 

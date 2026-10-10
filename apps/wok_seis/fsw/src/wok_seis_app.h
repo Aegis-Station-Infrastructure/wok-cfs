@@ -5,9 +5,9 @@
 /************************************************************************
 * WOK_SEIS — Application Private Header
 *
-* v5.0 — Dual-mode EM source: source config, sweep records, onboard
-*        pilot correlation (tick-chunked), correlated-trace product.
-* v2.1 — Added thumper control and seismic evaluation
+* App data for acquisition, source configuration, onboard sweep
+* correlation, site stacking, first-break picking, evaluation, and
+* chunked file downlink.
 ************************************************************************/
 #ifndef WOK_SEIS_APP_H
 #define WOK_SEIS_APP_H
@@ -21,7 +21,6 @@
 #include "wok_seis_events.h"
 
 #define WOK_SEIS_PIPE_NAME   "WOK_SEIS_PIPE"
-#define WOK_SEIS_PIPE_DEPTH  16
 
 /* Regenerated-pilot buffer: WOK_SRC_SWEEP_MAX_DUR_SEC at the default
  * 4 kHz (64 KB as floats). Longer dur*fs products are clamped (evented). */
@@ -30,6 +29,7 @@
 typedef struct
 {
     CFE_SB_PipeId_t          CmdPipe;
+    uint32                   RunStatus;
     WOK_Seis_HkTlm_t        HkTlm;
     WOK_Seis_StatusTlm_t    StatusTlm;
     WOK_Seis_QuicklookTlm_t QuicklookTlm;
@@ -105,7 +105,8 @@ typedef struct
     float   PrevAcqSiteY_m;     /*   per-site counters reset on change   */
 
     /* Source configuration (CONFIG_SOURCE cmd; defaults from platform
-     * cfg preserve v4.0 impulse behavior). Applied to the HAL at ARM. */
+     * cfg preserve the drop-weight (pre-5.0) source's impulse
+     * behavior). Applied to the HAL at ARM. */
     uint8   SourceMode;         /* WOK_HAL_SRC_MODE_*                    */
     float   SourceEnergyJ;      /* impulse bank target                   */
     float   SweepF0_Hz;
@@ -181,11 +182,10 @@ typedef struct
     uint8   QC_DropoutFlag;
     uint32  LastSampleCount;    /* prev cycle's sample count, for dropout */
 
-    /* Source state (from HAL; field names kept from the thumper era —
-     * they are baked into TLM decoders) */
-    uint8   ThumperState;       /* WOK_HAL_SRC_* */
-    float   ThumperForce_N;     /* Last shot's peak plate force */
-    uint32  ThumperTimestamp_ms;
+    /* Source state (from HAL) */
+    uint8   SourceState;       /* WOK_HAL_SRC_* */
+    float   SourceForce_N;     /* Last shot's peak plate force */
+    uint32  SourceTimestamp_ms;
 
     /* SeqId echo */
     uint16  LastSeqId;

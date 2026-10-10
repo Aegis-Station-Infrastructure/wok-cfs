@@ -21,6 +21,7 @@
 typedef struct
 {
     CFE_SB_PipeId_t       CmdPipe;
+    uint32                RunStatus;
     WOK_Hk_HealthTlm_t   HealthTlm;
 
     /* Raw sensor readings (populated from HAL or other apps' TLM) */
@@ -43,6 +44,7 @@ typedef struct
 
     /* Cached sequencer state (from SEQ mode TLM) */
     uint8   SeqState;
+    uint8   ModeTlmLenErrReported;   /* one event per boot, then counted */
 
     uint16  CmdCounter;
     uint16  ErrCounter;
@@ -55,5 +57,7 @@ void  WOK_Hk_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr);
 void  WOK_Hk_ReportHealth(void);
 void  WOK_Hk_CheckFaults(void);
 bool  WOK_Hk_VerifyCmdLength(CFE_MSG_Message_t *MsgPtr, size_t ExpectedLength);
+bool  WOK_Hk_VerifyTlmLength(const CFE_SB_Buffer_t *BufPtr, size_t ExpectedLength,
+                             uint8 *Reported);
 
 #endif /* WOK_HK_APP_H */

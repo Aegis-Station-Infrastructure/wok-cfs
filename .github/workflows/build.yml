@@ -32,8 +32,15 @@ jobs:
       - name: Host prerequisites
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q cmake build-essential
+          sudo apt-get install -y -q cmake build-essential python3-websockets
           sudo sysctl fs.mqueue.msg_max=128
+
+      - name: Ground tools compile + CLI smoke
+        run: |
+          cd wok-cfs
+          python3 -m py_compile ground/*.py tools/*.py
+          python3 ground/wok_bridge.py --help
+          python3 ground/wok_console.py --help
 
       - name: Install WOK into the cFS tree
         run: |

@@ -46,7 +46,7 @@ Before using the console:
 | `seq.resume` | Resume from SAFE |
 | `seq.waypoint <idx>` | Override waypoint index |
 | `seq.mode <0\|1>` | Mission mode: 0 = drill-inline, 1 = survey-first (score all sites, then drill the best) |
-| `seq.placement <0\|1>` | Placement mode: 0 = fixed array (legacy, default), 1 = per-pod placement — DEPLOY/VERIFY/STOW run the WOK-CP-001 placement, coupling-verification, and retrieval sub-sequences |
+| `seq.placement <0\|1>` | Placement mode: 0 = fixed array (legacy, default), 1 = per-pod placement — DEPLOY/VERIFY/STOW run the placement, coupling-verification, and retrieval sub-sequences |
 | `seq.loadwp <idx> <fwd> <lat> [drill] [srcmode] [energy_J] [recal]` | Upload/replace one waypoint (start-frame deltas, metres). `srcmode` 0 = impulse (default), 1 = sweep; `energy_J` impulse bank energy, 0 = flight default; `recal` 1 = hold after MOVE for ground recalibration. Zeros preserve prior behavior exactly. |
 | `seq.release` | Release a recalibration HOLD (rejected outside HOLD; the hold also auto-proceeds after `WOK_SEQ_HOLD_TIMEOUT_SEC`) |
 | `seq.wpcount <n>` | Set the number of active waypoints |
@@ -122,8 +122,8 @@ Example: `seis.start 6 4000 1 0F 3.0 0.0` — one 6-second record stamped at sit
 
 SET_POD_GEOMETRY (CC 11) is sequencer-computed (actual placed geometry) and has no console form; SEIS status TLM carries the plate metric (`plate_ratio`, `plate_baseline`, `plate_ok`, `plate_reseats`, `plate_degraded`), the test-shot pod scores (`pod_scores`, `pod_score_ok_mask`, `test_shots`), and the sync residuals (`sync_residual_ms`, `sync_suspect_mask`) — all decoded by the console.
 
-**Dual-mode source workflow (v5.0):** the source defaults to impulse mode
-at the flight-default energy — nothing to configure for legacy operations.
+**Dual-mode source workflow:** the source defaults to impulse mode
+at the default energy — nothing to configure for the stock mission.
 For a sweep shot: `seis.source 1` (optionally with band/duration), then the
 usual `seis.start` → `seis.thump_arm` → `seis.thump_fire`. In sweep mode
 the record window automatically extends by the sweep duration, and after
@@ -145,6 +145,7 @@ selection for sequenced missions goes through `seq.loadwp`'s
 | `drill.start [depth] [rpm] [x] [y]` | Begin drilling (default 1.0m, 200 RPM, site 0,0) |
 | `drill.stop` | Stop drill motor |
 | `drill.sample [heat_s] [cool_s]` | Thermal sample (default 60s heat, 30s cool) |
+| `drill.stopsample` | Stop the thermal vaporization cycle (STOP_SAMPLE) |
 | `drill.abort` | Emergency stop all drill ops |
 | `drill.hk` | Request housekeeping TLM |
 
@@ -199,30 +200,38 @@ directory):
   pressure, volatile ppm, sample state) — a ready-to-plot record of every
   drill cycle observed during the session
 
-SEIS STATUS telemetry now includes strike-to-trace sync (`strike_sample_idx`,
-`strike_valid`, `trace_samples`) and, after each site's final strike, the
+SEIS STATUS telemetry carries the strike-to-trace sync (`strike_sample_idx`,
+`strike_valid`, `trace_samples`); after each site's final strike, the
 onboard first-break picks (`first_break_ms`, `pick_quality`, `stack_fold`,
-`coherence_pct`). v5.0 adds the EM source status: `source_mode`, `bank_V`,
-`bank_soc_pct` (percent of the shot's charge target), `sweep_progress_pct`,
-and `corr_progress_pct` (onboard correlation, 100 = idle/complete). The
-`thumper` state field reads IDLE/CHARGING/ARMED/FIRED/SWEEPING. DRILL
-STATUS includes `wob_N` and `rop_mps`.
+`coherence_pct` — the zero-lag stack correlation); and the EM source
+status: `source` state (IDLE/CHARGING/ARMED/FIRED/SWEEPING), `source_mode`,
+`source_force_n`, `bank_V`, `bank_soc_pct` (percent of the shot's charge
+target), `sweep_progress_pct`, and `corr_progress_pct` (onboard
+correlation, 100 = idle/complete). DRILL STATUS includes `wob_N` and
+`rop_mps`.
 
 ## Web Bridge
 
 `wok_bridge.py` serves the same command/telemetry streams to browser
 clients over WebSocket:
 
-    python3 wok_bridge.py [--cfs-host 127.0.0.1] [--cmd-port 1234] [--tlm-port 2234] [--ws-port 8765]
+    python3 wok_bridge.py [--cfs-host 127.0.0.1] [--cmd-port 1234] [--tlm-port 2234] [--ws-host 127.0.0.1] [--ws-port 8765]
+
+**There is no authentication.** Anything that can reach the WebSocket can
+command the rover, so the bridge listens on localhost by default. Pass
+`--ws-host 0.0.0.0` only on a trusted LAN. The dashboard connects to port
+8765 on the page's host; append `?ws=<port>` to the dashboard URL if the
+bridge runs elsewhere (`tools/wok_sim.sh up` prints the right URL).
+Python 3.10+ and `websockets` (`pip install -r ground/requirements.txt`).
 
 It is a **pure relay**: every telemetry value originates from the
 HAL-backed FSW via TO_LAB (decoded to JSON and broadcast, including the
-v4.0 targeting fields and file-chunk progress), and every command goes to
+targeting fields and file-chunk progress), and every command goes to
 CI_LAB. There is no simulation mode — to run without hardware, run cFS
 with the `linux_sim` HAL. On client connect the bridge sends the TO_LAB
 enable automatically. Note the bridge and the console both bind the
 telemetry port (2234); run one at a time. The bridge requires the
-`websockets` Python package (`pip install websockets`), and the web
+`websockets` Python package (`pip install -r ground/requirements.txt`), and the web
 dashboard loads React from a CDN, so the browser needs internet access
 even when the sim itself is fully local.
 

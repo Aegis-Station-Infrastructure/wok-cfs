@@ -19,5 +19,6 @@
 #define WOK_GEO_PERF_ID          (WOK_PERF_BASE + 2)
 #define WOK_SEIS_PERF_ID         (WOK_PERF_BASE + 3)
 #define WOK_HK_PERF_ID           (WOK_PERF_BASE + 4)
+#define WOK_DRILL_PERF_ID        (WOK_PERF_BASE + 5)
 
 #endif /* WOK_PERFIDS_H */

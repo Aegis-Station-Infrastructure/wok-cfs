@@ -14,6 +14,8 @@
 #define WOK_HK_CMD_ERR_EID           4
 #define WOK_HK_PIPE_ERR_EID          5
 #define WOK_HK_LEN_ERR_EID           6
+#define WOK_HK_SUB_ERR_EID           7
+#define WOK_HK_TLM_LEN_ERR_EID       8
 #define WOK_HK_BATTERY_LOW_EID       20
 #define WOK_HK_TEMP_HIGH_EID         21
 #define WOK_HK_TILT_EXCEED_EID       22

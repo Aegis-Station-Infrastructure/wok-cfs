@@ -5,42 +5,13 @@
 /************************************************************************
 * WOK_SEIS — Seismic Acquisition + EM Source + Evaluate (HAL-integrated)
 *
-* v5.0 — Dual-mode EM source (impulse + swept-sine):
-*   - CONFIG_SOURCE (CC 9) selects mode + energy / sweep params per
-*     shot; ARM/FIRE/RESET keep their external behavior (ARM charges
-*     the capacitor bank, FIRE strikes or starts the sweep, RESET
-*     safes the bank).
-*   - Sweep records extend the commanded window by the sweep duration
-*     (record = sweep + listen), then are cross-correlated onboard
-*     against the analytically regenerated pilot — chunked across HK
-*     ticks so the main loop never blocks more than one tick. The
-*     equivalent-impulse trace is archived (corr_NNNN.wok) and feeds
-*     the existing stack/picker/EVALUATE chain unchanged.
-*   - Status TLM gains source mode, bank V/SOC, sweep + correlation
-*     progress. File headers v3 carry the shot context.
-*
-* v2.5 — Direct metrics to spec:
-*   - Site stacking: strike-aligned accumulation across acquisitions,
-*     fold + zero-lag coherence tracked, stack_NNNN.wok archived after
-*     the site's final strike.
-*   - STA/LTA first-break picker (frozen pre-strike LTA) runs on the
-*     stack; FirstBreakMs + PickQuality telemetered and filed.
-*   - QC and quicklook now computed from the REAL drained trace
-*     (clipped-sample counts, trace-tail RMS/Peak/DC), not from the
-*     HAL's synthetic monitoring window.
-*
-* v2.4 — Real acquisition path:
-*   - Samples are drained from the HAL into a per-strike trace buffer
-*     and written to storage (seis_NNNN.wok) on acquisition complete.
-*   - Strike t0 is a per-channel sample index (thumper and ADC share a
-*     hardware clock) — telemetered and stamped into the trace file.
-*   - StartAcq carries the survey-site pose (from SEQ/NAV) so every
-*     record has its own source-receiver geometry.
-*
-* v2.1 — Added thumper control (ARM/FIRE/RESET) and EVALUATE.
-*
-* Calls WOK_HAL_Seis_* for ADC, WOK_HAL_Src_* for the EM source, and
-* WOK_HAL_Storage_* for trace-file writes.
+* Drives the geophone ADC (WOK_HAL_Seis_*) and the dual-mode EM source
+* (WOK_HAL_Src_*): records per-shot traces with an electrically latched
+* strike t0, cross-correlates sweep records against the regenerated
+* pilot (chunked across HK ticks), stacks strikes per site, picks first
+* breaks, and runs the onboard two-layer refraction EVALUATE. Products
+* (seis_/corr_/stack_/coup_NNNN.wok) are archived via WOK_HAL_Storage_*
+* and downlinkable in chunks.
 ************************************************************************/
 #include "wok_seis_app.h"
 #include "wok_hal_seis.h"
@@ -80,22 +51,34 @@ static void WOK_Seis_RunPicker(void);
 static void WOK_Seis_WriteStackFile(void);
 static void WOK_Seis_StartDownlink(const WOK_Seis_DownlinkFileCmd_t *Cmd);
 static void WOK_Seis_PumpDownlink(void);
-static bool WOK_Seis_EvaluateFromPicks(uint8_t *flag, float *confidence);
+static bool WOK_Seis_EvaluateFromPicks(uint8 *flag, float *confidence);
 
 void WOK_Seis_AppMain(void)
 {
     int32 Status; CFE_SB_Buffer_t *BufPtr = NULL;
     CFE_ES_PerfLogEntry(WOK_SEIS_PERF_ID);
+    WOK_Seis_AppData.RunStatus = CFE_ES_RunStatus_APP_RUN;
     Status = WOK_Seis_AppInit();
-    if (Status != CFE_SUCCESS) return;
-    while (true) {
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_ES_WriteToSysLog("WOK_SEIS: Init failed (0x%08lX)\n", (unsigned long)Status);
+        WOK_Seis_AppData.RunStatus = CFE_ES_RunStatus_APP_ERROR;
+    }
+    while (CFE_ES_RunLoop(&WOK_Seis_AppData.RunStatus) == true) {
         CFE_ES_PerfLogExit(WOK_SEIS_PERF_ID);
         Status = CFE_SB_ReceiveBuffer(&BufPtr, WOK_Seis_AppData.CmdPipe, CFE_SB_PEND_FOREVER);
         CFE_ES_PerfLogEntry(WOK_SEIS_PERF_ID);
         if (Status == CFE_SUCCESS) WOK_Seis_ProcessCommandPacket(BufPtr);
-        else break;
+        else
+        {
+            CFE_EVS_SendEvent(WOK_SEIS_PIPE_ERR_EID, CFE_EVS_EventType_ERROR,
+                              "WOK_SEIS: SB pipe error (0x%08lX), app will exit",
+                              (unsigned long)Status);
+            WOK_Seis_AppData.RunStatus = CFE_ES_RunStatus_APP_ERROR;
+        }
     }
-    CFE_ES_ExitApp(CFE_ES_RunStatus_APP_ERROR);
+    CFE_ES_PerfLogExit(WOK_SEIS_PERF_ID);
+    CFE_ES_ExitApp(WOK_Seis_AppData.RunStatus);
 }
 
 int32 WOK_Seis_AppInit(void)
@@ -111,9 +94,21 @@ int32 WOK_Seis_AppInit(void)
      * one tick (SET_POD_GEOMETRY + CONFIG_SOURCE + START_ACQ + RESET +
      * ARM at a verification shot); the SB default limit of 4 silently
      * drops the tail of that burst ("Msg Limit Err"). */
-    CFE_SB_SubscribeEx(CFE_SB_ValueToMsgId(WOK_SEIS_CMD_MID),
-                       WOK_Seis_AppData.CmdPipe, CFE_SB_DEFAULT_QOS, 8);
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_SEIS_SEND_HK_MID), WOK_Seis_AppData.CmdPipe);
+    Status = CFE_SB_SubscribeEx(CFE_SB_ValueToMsgId(WOK_SEIS_CMD_MID),
+                                WOK_Seis_AppData.CmdPipe, CFE_SB_DEFAULT_QOS, 8);
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(WOK_SEIS_SUB_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "WOK_SEIS: Subscribe to CMD failed (0x%08lX)", (unsigned long)Status);
+        return Status;
+    }
+    Status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_SEIS_SEND_HK_MID), WOK_Seis_AppData.CmdPipe);
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(WOK_SEIS_SUB_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "WOK_SEIS: Subscribe to SEND_HK failed (0x%08lX)", (unsigned long)Status);
+        return Status;
+    }
 
     CFE_MSG_Init(CFE_MSG_PTR(WOK_Seis_AppData.HkTlm.TlmHeader),
                  CFE_SB_ValueToMsgId(WOK_SEIS_TLM_MID), sizeof(WOK_Seis_HkTlm_t));
@@ -134,9 +129,9 @@ int32 WOK_Seis_AppInit(void)
     WOK_Seis_AppData.FaultMask         = WOK_FAULT_NONE;
     WOK_Seis_AppData.CmdCounter        = 0;
     WOK_Seis_AppData.ErrCounter        = 0;
-    WOK_Seis_AppData.ThumperState      = 0;
-    WOK_Seis_AppData.ThumperForce_N    = 0.0f;
-    WOK_Seis_AppData.ThumperTimestamp_ms = 0;
+    WOK_Seis_AppData.SourceState      = 0;
+    WOK_Seis_AppData.SourceForce_N    = 0.0f;
+    WOK_Seis_AppData.SourceTimestamp_ms = 0;
     WOK_Seis_AppData.EvalFlag          = 0;
     WOK_Seis_AppData.EvalConfidence    = 0.0f;
     WOK_Seis_AppData.SiteX_m           = 0.0f;
@@ -164,7 +159,8 @@ int32 WOK_Seis_AppInit(void)
         WOK_Seis_AppData.ClipCount[ch]    = 0;
     }
 
-    /* Source config defaults — preserve v4.0 behavior exactly */
+    /* Source config defaults — preserve the drop-weight (pre-5.0)
+     * source's behavior exactly */
     WOK_Seis_AppData.SourceMode    = WOK_SRC_DEFAULT_MODE;
     WOK_Seis_AppData.SourceEnergyJ = WOK_SRC_DEFAULT_ENERGY_J;
     WOK_Seis_AppData.SweepF0_Hz    = WOK_SRC_DEFAULT_SWEEP_F0_HZ;
@@ -211,7 +207,7 @@ int32 WOK_Seis_AppInit(void)
     WOK_HAL_Storage_Init();
 
     CFE_EVS_SendEvent(WOK_SEIS_INIT_INF_EID, CFE_EVS_EventType_INFORMATION,
-                      "WOK_SEIS: App initialised (v5.0.0) — dual-mode EM source");
+                      "WOK_SEIS: App initialised (v" WOK_VERSION_STRING ") — dual-mode EM source");
     return CFE_SUCCESS;
 }
 
@@ -290,7 +286,7 @@ static void WOK_Seis_DrainSamples(void)
         if (keep < n_samps && !WOK_Seis_AppData.TraceTruncated)
         {
             WOK_Seis_AppData.TraceTruncated = 1;
-            CFE_EVS_SendEvent(WOK_SEIS_ACQ_STOP_EID, CFE_EVS_EventType_ERROR,
+            CFE_EVS_SendEvent(WOK_SEIS_TRACE_FULL_EID, CFE_EVS_EventType_ERROR,
                               "WOK_SEIS: Trace buffer full at %lu samps/chan — truncating",
                               (unsigned long)WOK_Seis_AppData.TraceCount);
         }
@@ -314,7 +310,7 @@ static void WOK_Seis_FillHeaderCommon(WOK_Seis_FileHeader_t *hdr, uint32 spc,
     hdr->StrikeValid     = strike_valid;
     hdr->ChannelMask     = WOK_Seis_AppData.ChannelMask;
     hdr->SeqId           = WOK_Seis_AppData.LastSeqId;
-    hdr->ThumperForce_N  = WOK_Seis_AppData.ThumperForce_N;
+    hdr->SourceForce_N  = WOK_Seis_AppData.SourceForce_N;
     hdr->SiteX_m         = WOK_Seis_AppData.SiteX_m;
     hdr->SiteY_m         = WOK_Seis_AppData.SiteY_m;
     hdr->SiteHeadingDeg  = WOK_Seis_AppData.SiteHeadingDeg;
@@ -362,7 +358,7 @@ static void WOK_Seis_WriteTraceFile(void)
 
     if (WOK_HAL_Storage_WriteFile(name, &WOK_Seis_AppData.TraceFile, size) == WOK_HAL_OK)
     {
-        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITTEN_EID, CFE_EVS_EventType_INFORMATION,
+        CFE_EVS_SendEvent(WOK_SEIS_TRACE_WRITTEN_EID, CFE_EVS_EventType_INFORMATION,
                           "WOK_SEIS: %s — %luk samps x%u ch, strike@%lu%s, site (%.1f,%.1f)",
                           name,
                           (unsigned long)(WOK_Seis_AppData.TraceCount / 1000),
@@ -375,7 +371,7 @@ static void WOK_Seis_WriteTraceFile(void)
     else
     {
         WOK_Seis_AppData.ErrCounter++;
-        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITTEN_EID, CFE_EVS_EventType_ERROR,
+        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITE_ERR_EID, CFE_EVS_EventType_ERROR,
                           "WOK_SEIS: Trace file write FAILED (%s, %lu bytes)",
                           name, (unsigned long)size);
     }
@@ -400,7 +396,7 @@ static void WOK_Seis_ComputePlateMetric(void)
 
     if (WOK_Seis_AppData.ShotMode != WOK_HAL_SRC_MODE_IMPULSE) return;
     if (!WOK_Seis_AppData.StrikeValid ||
-        WOK_Seis_AppData.ThumperForce_N <= 0.0f) return;
+        WOK_Seis_AppData.SourceForce_N <= 0.0f) return;
 
     uint8  nch = WOK_Seis_AppData.TraceNumChans;
     uint32 s0  = WOK_Seis_AppData.StrikeSampleIdx;
@@ -416,7 +412,7 @@ static void WOK_Seis_ComputePlateMetric(void)
         acc += v * v;
     }
     float rms = sqrtf((float)(acc / (double)(s1 - s0)));
-    WOK_Seis_AppData.PlateRatio = rms / WOK_Seis_AppData.ThumperForce_N;
+    WOK_Seis_AppData.PlateRatio = rms / WOK_Seis_AppData.SourceForce_N;
 
     if (WOK_Seis_AppData.PlateBaseline <= 0.0f)
     {
@@ -434,7 +430,7 @@ static void WOK_Seis_ComputePlateMetric(void)
         WOK_Seis_AppData.PlateOk = 0;
         if (WOK_Seis_AppData.AcceptDegraded)
             WOK_Seis_AppData.PlateDegradedSite = 1;
-        CFE_EVS_SendEvent(WOK_SEIS_PLATE_EID, CFE_EVS_EventType_ERROR,
+        CFE_EVS_SendEvent(WOK_SEIS_PLATE_LOW_EID, CFE_EVS_EventType_ERROR,
                           "WOK_SEIS: Plate coupling LOW — ratio %.1f vs baseline %.1f (%.0f%%)%s",
                           (double)WOK_Seis_AppData.PlateRatio,
                           (double)WOK_Seis_AppData.PlateBaseline,
@@ -452,7 +448,7 @@ static void WOK_Seis_ComputePlateMetric(void)
 /*  RMS over the post-t0 window, normalized by geometric spreading    */
 /*  at the pod's ACTUAL offset, ratioed to the array median. The      */
 /*  plate factor is common-mode and cancels: this is a pure pod-side  */
-/*  measurement, the §4.4 metric's missing half. The spectral-        */
+/*  measurement, the plate metric's missing half. The spectral-      */
 /*  coherence term is deferred until the coupling model has spectral  */
 /*  structure (Sim Model Spec §11.8; bench item).                     */
 /* ================================================================== */
@@ -501,7 +497,7 @@ static void WOK_Seis_ComputePodScores(void)
     WOK_Seis_AppData.PodScoreValid = 1;
     WOK_Seis_AppData.TestShotCount++;
 
-    CFE_EVS_SendEvent(WOK_SEIS_PLATE_EID, CFE_EVS_EventType_INFORMATION,
+    CFE_EVS_SendEvent(WOK_SEIS_POD_SCORES_EID, CFE_EVS_EventType_INFORMATION,
                       "WOK_SEIS: Pod scores %.2f/%.2f/%.2f/%.2f ok=0x%X (test shot %u)",
                       (double)WOK_Seis_AppData.PodScore[0],
                       (double)WOK_Seis_AppData.PodScore[1],
@@ -634,7 +630,7 @@ static void WOK_Seis_SyncCheck(void)
             WOK_Seis_AppData.SyncSuspectMask |= (uint8)(1u << p);
     }
 
-    CFE_EVS_SendEvent(WOK_SEIS_PLATE_EID,
+    CFE_EVS_SendEvent(WOK_SEIS_SYNC_EID,
                       WOK_Seis_AppData.SyncSuspectMask
                           ? CFE_EVS_EventType_ERROR
                           : CFE_EVS_EventType_INFORMATION,
@@ -683,14 +679,14 @@ static void WOK_Seis_WriteCoupFile(void)
              (unsigned long)(WOK_Seis_AppData.StackFileIndex + 1));
 
     if (WOK_HAL_Storage_WriteFile(name, &hdr, sizeof(hdr)) == WOK_HAL_OK)
-        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITTEN_EID, CFE_EVS_EventType_INFORMATION,
+        CFE_EVS_SendEvent(WOK_SEIS_COUP_WRITTEN_EID, CFE_EVS_EventType_INFORMATION,
                           "WOK_SEIS: %s — verified %u/4, site (%.1f,%.1f)",
                           name, hdr.VerifiedCount,
                           (double)hdr.SiteX_m, (double)hdr.SiteY_m);
     else
     {
         WOK_Seis_AppData.ErrCounter++;
-        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITTEN_EID, CFE_EVS_EventType_ERROR,
+        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITE_ERR_EID, CFE_EVS_EventType_ERROR,
                           "WOK_SEIS: Coupling record write FAILED (%s)", name);
     }
 }
@@ -795,7 +791,7 @@ static void WOK_Seis_StartCorrelation(void)
 
     if (fs <= 0.0f || f1 <= f0 || dur <= 0.0f)
     {
-        CFE_EVS_SendEvent(WOK_SEIS_CORR_EID, CFE_EVS_EventType_ERROR,
+        CFE_EVS_SendEvent(WOK_SEIS_CORR_ERR_EID, CFE_EVS_EventType_ERROR,
                           "WOK_SEIS: Correlation skipped — bad pilot (%.0f-%.0f Hz %.1fs)",
                           (double)f0, (double)f1, (double)dur);
         return;
@@ -805,7 +801,7 @@ static void WOK_Seis_StartCorrelation(void)
     if (np > WOK_SEIS_PILOT_MAX_SAMPS)
     {
         np = WOK_SEIS_PILOT_MAX_SAMPS;
-        CFE_EVS_SendEvent(WOK_SEIS_CORR_EID, CFE_EVS_EventType_ERROR,
+        CFE_EVS_SendEvent(WOK_SEIS_CORR_ERR_EID, CFE_EVS_EventType_ERROR,
                           "WOK_SEIS: Pilot clamped to %u samps (dur*fs too long)",
                           (unsigned int)np);
     }
@@ -908,7 +904,7 @@ static void WOK_Seis_WriteCorrFile(void)
 
     if (WOK_HAL_Storage_WriteFile(name, &WOK_Seis_AppData.CorrFile, size) == WOK_HAL_OK)
     {
-        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITTEN_EID, CFE_EVS_EventType_INFORMATION,
+        CFE_EVS_SendEvent(WOK_SEIS_CORR_WRITTEN_EID, CFE_EVS_EventType_INFORMATION,
                           "WOK_SEIS: %s — equivalent-impulse trace, site (%.1f,%.1f)",
                           name,
                           (double)WOK_Seis_AppData.SiteX_m,
@@ -917,7 +913,7 @@ static void WOK_Seis_WriteCorrFile(void)
     else
     {
         WOK_Seis_AppData.ErrCounter++;
-        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITTEN_EID, CFE_EVS_EventType_ERROR,
+        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITE_ERR_EID, CFE_EVS_EventType_ERROR,
                           "WOK_SEIS: Corr file write FAILED (%s)", name);
     }
 }
@@ -992,7 +988,7 @@ static void WOK_Seis_RunPicker(void)
         }
     }
 
-    CFE_EVS_SendEvent(WOK_SEIS_ACQ_COMPLETE_EID, CFE_EVS_EventType_INFORMATION,
+    CFE_EVS_SendEvent(WOK_SEIS_PICKS_EID, CFE_EVS_EventType_INFORMATION,
                       "WOK_SEIS: Picks (fold %u, coh %.0f%%) — %.2f/%.2f/%.2f/%.2f ms",
                       WOK_Seis_AppData.StackFold,
                       (double)(WOK_Seis_AppData.StackCoherence * 100.0f),
@@ -1032,7 +1028,7 @@ static void WOK_Seis_WriteStackFile(void)
 
     if (WOK_HAL_Storage_WriteFile(name, &WOK_Seis_AppData.StackFile, size) == WOK_HAL_OK)
     {
-        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITTEN_EID, CFE_EVS_EventType_INFORMATION,
+        CFE_EVS_SendEvent(WOK_SEIS_STACK_WRITTEN_EID, CFE_EVS_EventType_INFORMATION,
                           "WOK_SEIS: %s — fold %u, coh %u%%, site (%.1f,%.1f)",
                           name, hdr->StackFold, hdr->CoherencePct,
                           (double)WOK_Seis_AppData.SiteX_m,
@@ -1041,7 +1037,7 @@ static void WOK_Seis_WriteStackFile(void)
     else
     {
         WOK_Seis_AppData.ErrCounter++;
-        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITTEN_EID, CFE_EVS_EventType_ERROR,
+        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITE_ERR_EID, CFE_EVS_EventType_ERROR,
                           "WOK_SEIS: Stack file write FAILED (%s)", name);
     }
 }
@@ -1051,8 +1047,8 @@ static void WOK_Seis_WriteStackFile(void)
 /* ================================================================== */
 static void WOK_Seis_UpdateFromHAL(void)
 {
-    uint8_t acq = 0;
-    uint32_t samp = 0;
+    uint8 acq = 0;
+    uint32 samp = 0;
 
     WOK_HAL_Seis_GetStatus(&acq, &samp);
     WOK_Seis_AppData.Acquiring       = acq;
@@ -1102,7 +1098,7 @@ static void WOK_Seis_UpdateFromHAL(void)
         }
         else
         {
-            CFE_EVS_SendEvent(WOK_SEIS_PLATE_EID, CFE_EVS_EventType_INFORMATION,
+            CFE_EVS_SendEvent(WOK_SEIS_STACK_SKIP_EID, CFE_EVS_EventType_INFORMATION,
                               "WOK_SEIS: Record kept out of stack (plate low) — fold stays %u",
                               WOK_Seis_AppData.StackFold);
         }
@@ -1117,13 +1113,13 @@ static void WOK_Seis_UpdateFromHAL(void)
         WOK_Seis_AppData.QC_ClipFlag     = 0;
         WOK_Seis_AppData.QC_DeadChanMask = 0;
         uint8 slot = 0;
-        for (uint8_t ch = 0; ch < WOK_SEIS_MAX_CHANNELS; ch++)
+        for (uint8 ch = 0; ch < WOK_SEIS_MAX_CHANNELS; ch++)
         {
             if (!(WOK_Seis_AppData.ChannelMask & (1u << ch))) continue;
             if (WOK_Seis_AppData.ClipCount[slot] > 0)
                 WOK_Seis_AppData.QC_ClipFlag = 1;
             if (WOK_Seis_AppData.QuicklookTlm.RMS[slot] < WOK_SEIS_QC_DEAD_THRESHOLD)
-                WOK_Seis_AppData.QC_DeadChanMask |= (uint8_t)(1u << ch);
+                WOK_Seis_AppData.QC_DeadChanMask |= (uint8)(1u << ch);
             slot++;
         }
         /* Dropout: sample count didn't advance since last HK cycle */
@@ -1133,20 +1129,20 @@ static void WOK_Seis_UpdateFromHAL(void)
     WOK_Seis_AppData.LastSampleCount = samp;
 
     /* Update source state from HAL */
-    WOK_HAL_Src_GetState(&WOK_Seis_AppData.ThumperState);
+    WOK_HAL_Src_GetState(&WOK_Seis_AppData.SourceState);
     WOK_HAL_Src_GetBank(&WOK_Seis_AppData.BankV,
                         &WOK_Seis_AppData.BankSOC_pct);
-    if (WOK_Seis_AppData.ThumperState == WOK_HAL_SRC_SWEEPING ||
-        WOK_Seis_AppData.ThumperState == WOK_HAL_SRC_FIRED)
+    if (WOK_Seis_AppData.SourceState == WOK_HAL_SRC_SWEEPING ||
+        WOK_Seis_AppData.SourceState == WOK_HAL_SRC_FIRED)
     {
         WOK_HAL_Src_GetSweepProgress(&WOK_Seis_AppData.SweepProgress);
     }
 
     /* Read last shot info once delivered */
-    if (WOK_Seis_AppData.ThumperState == WOK_HAL_SRC_FIRED)
+    if (WOK_Seis_AppData.SourceState == WOK_HAL_SRC_FIRED)
     {
-        WOK_HAL_Src_GetShotInfo(&WOK_Seis_AppData.ThumperForce_N,
-                                &WOK_Seis_AppData.ThumperTimestamp_ms);
+        WOK_HAL_Src_GetShotInfo(&WOK_Seis_AppData.SourceForce_N,
+                                &WOK_Seis_AppData.SourceTimestamp_ms);
     }
 }
 
@@ -1184,7 +1180,7 @@ void WOK_Seis_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                 WOK_Seis_AppData.LastSeqId = ((WOK_Seis_NoArgsCmd_t *)BufPtr)->SeqId;
                 WOK_Seis_AppData.CmdCounter++;
                 CFE_EVS_SendEvent(WOK_SEIS_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
-                                  "WOK_SEIS: NOOP (v2.1.0)");
+                                  "WOK_SEIS: NOOP (v" WOK_VERSION_STRING ")");
             } break;
 
         /* ── CC 1: RESET COUNTERS ────────────────────────────────── */
@@ -1338,15 +1334,15 @@ void WOK_Seis_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                                           WOK_Seis_AppData.SweepF1_Hz,
                                           WOK_Seis_AppData.SweepDur_s) != WOK_HAL_OK) {
                     WOK_Seis_AppData.ErrCounter++;
-                    CFE_EVS_SendEvent(WOK_SEIS_SRC_CFG_EID, CFE_EVS_EventType_ERROR,
+                    CFE_EVS_SendEvent(WOK_SEIS_SRC_CFG_ERR_EID, CFE_EVS_EventType_ERROR,
                                       "WOK_SEIS: Source configure rejected — arming with previous shot config");
                 }
                 if (WOK_HAL_Src_Arm() == WOK_HAL_OK) {
-                    CFE_EVS_SendEvent(WOK_SEIS_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
+                    CFE_EVS_SendEvent(WOK_SEIS_SRC_ARM_EID, CFE_EVS_EventType_INFORMATION,
                                       "WOK_SEIS: Source arming (bank charging)");
                 } else {
                     WOK_Seis_AppData.ErrCounter++;
-                    CFE_EVS_SendEvent(WOK_SEIS_LEN_ERR_EID, CFE_EVS_EventType_ERROR,
+                    CFE_EVS_SendEvent(WOK_SEIS_SRC_ARM_ERR_EID, CFE_EVS_EventType_ERROR,
                                       "WOK_SEIS: Source arm failed (not IDLE?)");
                 }
             } break;
@@ -1365,22 +1361,22 @@ void WOK_Seis_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                     WOK_Seis_AppData.ShotF0_Hz   = WOK_Seis_AppData.SweepF0_Hz;
                     WOK_Seis_AppData.ShotF1_Hz   = WOK_Seis_AppData.SweepF1_Hz;
                     WOK_Seis_AppData.ShotDur_s   = WOK_Seis_AppData.SweepDur_s;
-                    WOK_HAL_Src_GetShotInfo(&WOK_Seis_AppData.ThumperForce_N,
-                                            &WOK_Seis_AppData.ThumperTimestamp_ms);
+                    WOK_HAL_Src_GetShotInfo(&WOK_Seis_AppData.SourceForce_N,
+                                            &WOK_Seis_AppData.SourceTimestamp_ms);
                     if (WOK_Seis_AppData.SourceMode == WOK_HAL_SRC_MODE_SWEEP) {
-                        CFE_EVS_SendEvent(WOK_SEIS_ACQ_START_EID, CFE_EVS_EventType_INFORMATION,
+                        CFE_EVS_SendEvent(WOK_SEIS_SRC_FIRED_EID, CFE_EVS_EventType_INFORMATION,
                                           "WOK_SEIS: Source FIRED — sweep %.0f-%.0f Hz %.1fs",
                                           (double)WOK_Seis_AppData.ShotF0_Hz,
                                           (double)WOK_Seis_AppData.ShotF1_Hz,
                                           (double)WOK_Seis_AppData.ShotDur_s);
                     } else {
-                        CFE_EVS_SendEvent(WOK_SEIS_ACQ_START_EID, CFE_EVS_EventType_INFORMATION,
-                                          "WOK_SEIS: Thumper FIRED — %.1fN",
-                                          (double)WOK_Seis_AppData.ThumperForce_N);
+                        CFE_EVS_SendEvent(WOK_SEIS_SRC_FIRED_EID, CFE_EVS_EventType_INFORMATION,
+                                          "WOK_SEIS: Source FIRED — %.1fN",
+                                          (double)WOK_Seis_AppData.SourceForce_N);
                     }
                 } else {
                     WOK_Seis_AppData.ErrCounter++;
-                    CFE_EVS_SendEvent(WOK_SEIS_LEN_ERR_EID, CFE_EVS_EventType_ERROR,
+                    CFE_EVS_SendEvent(WOK_SEIS_SRC_FIRE_ERR_EID, CFE_EVS_EventType_ERROR,
                                       "WOK_SEIS: Source fire failed (not ARMED?)");
                 }
             } break;
@@ -1394,7 +1390,7 @@ void WOK_Seis_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                  * armed, mid-sweep) safe the bank through the dump path. */
                 if (WOK_HAL_Src_Reset() != WOK_HAL_OK)
                     WOK_HAL_Src_Abort();
-                CFE_EVS_SendEvent(WOK_SEIS_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
+                CFE_EVS_SendEvent(WOK_SEIS_SRC_RESET_EID, CFE_EVS_EventType_INFORMATION,
                                   "WOK_SEIS: Source reset");
             } break;
 
@@ -1403,12 +1399,12 @@ void WOK_Seis_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
             if (WOK_Seis_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Seis_NoArgsCmd_t))) {
                 WOK_Seis_AppData.LastSeqId = ((WOK_Seis_NoArgsCmd_t *)BufPtr)->SeqId;
                 WOK_Seis_AppData.CmdCounter++;
-                uint8_t flag = 0;
+                uint8 flag = 0;
                 float conf = 0.0f;
                 if (WOK_Seis_EvaluateFromPicks(&flag, &conf))
                 {
                     /* Verdict derived from the recorded data */
-                    CFE_EVS_SendEvent(WOK_SEIS_ACQ_STOP_EID, CFE_EVS_EventType_INFORMATION,
+                    CFE_EVS_SendEvent(WOK_SEIS_EVAL_EID, CFE_EVS_EventType_INFORMATION,
                                       "WOK_SEIS: Evaluate — flag=%u conf=%.0f%% "
                                       "(v1=%.0f v2=%.0f h1=%.1fm icefrac=%.2f)",
                                       flag, (double)(conf * 100.0f),
@@ -1421,7 +1417,7 @@ void WOK_Seis_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                 {
                     /* No usable picks — fall back to the HAL evaluate */
                     WOK_HAL_Seis_Evaluate(&flag, &conf);
-                    CFE_EVS_SendEvent(WOK_SEIS_ACQ_STOP_EID, CFE_EVS_EventType_INFORMATION,
+                    CFE_EVS_SendEvent(WOK_SEIS_EVAL_EID, CFE_EVS_EventType_INFORMATION,
                                       "WOK_SEIS: Evaluate (HAL fallback) — flag=%u confidence=%.0f%%",
                                       flag, (double)(conf * 100.0f));
                 }
@@ -1448,7 +1444,7 @@ void WOK_Seis_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                 if (Cmd->SourceMode > WOK_HAL_SRC_MODE_SWEEP)
                 {
                     WOK_Seis_AppData.ErrCounter++;
-                    CFE_EVS_SendEvent(WOK_SEIS_SRC_CFG_EID, CFE_EVS_EventType_ERROR,
+                    CFE_EVS_SendEvent(WOK_SEIS_SRC_CFG_ERR_EID, CFE_EVS_EventType_ERROR,
                                       "WOK_SEIS: Bad source mode %u", Cmd->SourceMode);
                     break;
                 }
@@ -1480,7 +1476,7 @@ void WOK_Seis_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                     WOK_Seis_AppData.CmdCounter++;
                     WOK_Seis_AppData.PlateReseatsSite++;
                     WOK_Seis_AppData.PlateReseatTotal++;
-                    CFE_EVS_SendEvent(WOK_SEIS_PLATE_EID, CFE_EVS_EventType_INFORMATION,
+                    CFE_EVS_SendEvent(WOK_SEIS_PLATE_RESEAT_EID, CFE_EVS_EventType_INFORMATION,
                                       "WOK_SEIS: Plate reseat %u at this site (%u total)",
                                       WOK_Seis_AppData.PlateReseatsSite,
                                       WOK_Seis_AppData.PlateReseatTotal);
@@ -1488,7 +1484,7 @@ void WOK_Seis_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                 else
                 {
                     WOK_Seis_AppData.ErrCounter++;
-                    CFE_EVS_SendEvent(WOK_SEIS_PLATE_EID, CFE_EVS_EventType_ERROR,
+                    CFE_EVS_SendEvent(WOK_SEIS_PLATE_RESEAT_ERR_EID, CFE_EVS_EventType_ERROR,
                                       "WOK_SEIS: Plate reseat REJECTED (source busy)");
                 }
             } break;
@@ -1507,7 +1503,7 @@ void WOK_Seis_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                                                 Cmd->PodAttempt[p]);
                 }
                 WOK_Seis_AppData.PodMarginalMask = Cmd->PodMarginalMask;
-                CFE_EVS_SendEvent(WOK_SEIS_ACQ_START_EID, CFE_EVS_EventType_INFORMATION,
+                CFE_EVS_SendEvent(WOK_SEIS_POD_GEOM_EID, CFE_EVS_EventType_INFORMATION,
                                   "WOK_SEIS: Pod geometry — offsets %.2f/%.2f/%.2f/%.2f m, "
                                   "reseats %u/%u/%u/%u, marginal 0x%X",
                                   (double)Cmd->PodOffset_m[0], (double)Cmd->PodOffset_m[1],
@@ -1537,7 +1533,7 @@ void WOK_Seis_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
 /*  Returns false if the picks can't support a verdict (caller falls  */
 /*  back to the HAL evaluate).                                        */
 /* ================================================================== */
-static bool WOK_Seis_EvaluateFromPicks(uint8_t *flag, float *confidence)
+static bool WOK_Seis_EvaluateFromPicks(uint8 *flag, float *confidence)
 {
     const float *x = WOK_Seis_AppData.PodOffsets;
     const float *t = WOK_Seis_AppData.FirstBreakMs;   /* ms after t0 */
@@ -1680,7 +1676,7 @@ static void WOK_Seis_StartDownlink(const WOK_Seis_DownlinkFileCmd_t *Cmd)
                strlen(name) < WOK_SEIS_FILENAME_LEN ? strlen(name)
                                                     : WOK_SEIS_FILENAME_LEN);
         WOK_Seis_AppData.DownlinkSize = size;
-        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITTEN_EID, CFE_EVS_EventType_INFORMATION,
+        CFE_EVS_SendEvent(WOK_SEIS_DOWNLINK_EID, CFE_EVS_EventType_INFORMATION,
                           "WOK_SEIS: Downlinking %s (%lu bytes)",
                           name, (unsigned long)WOK_Seis_AppData.DownlinkSize);
     }
@@ -1721,7 +1717,7 @@ static void WOK_Seis_PumpDownlink(void)
     if (WOK_Seis_AppData.DownlinkOffset >= WOK_Seis_AppData.DownlinkSize)
     {
         WOK_Seis_AppData.DownlinkActive = 0;
-        CFE_EVS_SendEvent(WOK_SEIS_DATA_WRITTEN_EID, CFE_EVS_EventType_INFORMATION,
+        CFE_EVS_SendEvent(WOK_SEIS_DOWNLINK_DONE_EID, CFE_EVS_EventType_INFORMATION,
                           "WOK_SEIS: Downlink complete — %s (%lu bytes)",
                           WOK_Seis_AppData.ChunkTlm.FileName,
                           (unsigned long)WOK_Seis_AppData.DownlinkSize);
@@ -1738,7 +1734,7 @@ void WOK_Seis_ReportHousekeeping(void)
      * sequencer's RECORD state must keep waiting. */
     WOK_Seis_AppData.HkTlm.Acquiring     = (uint8)(WOK_Seis_AppData.Acquiring
                                           || WOK_Seis_AppData.CorrActive);
-    WOK_Seis_AppData.HkTlm.ThumperState  = WOK_Seis_AppData.ThumperState;
+    WOK_Seis_AppData.HkTlm.SourceState  = WOK_Seis_AppData.SourceState;
     WOK_Seis_AppData.HkTlm.FaultMask     = WOK_Seis_AppData.FaultMask;
     CFE_SB_TimeStampMsg(CFE_MSG_PTR(WOK_Seis_AppData.HkTlm.TlmHeader));
     CFE_SB_TransmitMsg(CFE_MSG_PTR(WOK_Seis_AppData.HkTlm.TlmHeader), true);
@@ -1755,11 +1751,11 @@ void WOK_Seis_PublishStatus(void)
     WOK_Seis_AppData.StatusTlm.Duration_sec      = WOK_Seis_AppData.Duration_sec;
     WOK_Seis_AppData.StatusTlm.SampleRate_Hz     = WOK_Seis_AppData.SampleRate_Hz;
     WOK_Seis_AppData.StatusTlm.FaultMask         = WOK_Seis_AppData.FaultMask;
-    WOK_Seis_AppData.StatusTlm.ThumperState      = WOK_Seis_AppData.ThumperState;
+    WOK_Seis_AppData.StatusTlm.SourceState      = WOK_Seis_AppData.SourceState;
     WOK_Seis_AppData.StatusTlm.EvalFlag          = WOK_Seis_AppData.EvalFlag;
     WOK_Seis_AppData.StatusTlm.SeqId             = WOK_Seis_AppData.LastSeqId;
     WOK_Seis_AppData.StatusTlm.EvalConfidence    = WOK_Seis_AppData.EvalConfidence;
-    WOK_Seis_AppData.StatusTlm.ThumperForce_N    = WOK_Seis_AppData.ThumperForce_N;
+    WOK_Seis_AppData.StatusTlm.SourceForce_N    = WOK_Seis_AppData.SourceForce_N;
     WOK_Seis_AppData.StatusTlm.StrikeSampleIdx   = WOK_Seis_AppData.StrikeSampleIdx;
     WOK_Seis_AppData.StatusTlm.StrikeValid       = WOK_Seis_AppData.StrikeValid;
     WOK_Seis_AppData.StatusTlm.TraceSamples      = WOK_Seis_AppData.TraceCount;
@@ -1775,7 +1771,7 @@ void WOK_Seis_PublishStatus(void)
     WOK_Seis_AppData.StatusTlm.EvalV2_mps  = WOK_Seis_AppData.EvalV2_mps;
     WOK_Seis_AppData.StatusTlm.EvalDepthM  = WOK_Seis_AppData.EvalDepthM;
     WOK_Seis_AppData.StatusTlm.EvalIceFrac = WOK_Seis_AppData.EvalIceFrac;
-    /* EM source status (v5.0) */
+    /* EM source status */
     WOK_Seis_AppData.StatusTlm.SourceMode  = WOK_Seis_AppData.SourceMode;
     {
         float soc = WOK_Seis_AppData.BankSOC_pct;

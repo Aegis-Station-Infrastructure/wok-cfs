@@ -28,5 +28,5 @@ drill_status.csv
 # Backups left by install.sh and editors
 *.bak
 
-# Local AI-assistant session settings
+# Local editor/tool settings
 .claude/

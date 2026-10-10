@@ -1,19 +1,24 @@
 # WOK cFS Flight Software
 
+[![build](https://github.com/Aegis-Station-Infrastructure/wok-cfs/actions/workflows/build.yml/badge.svg)](https://github.com/Aegis-Station-Infrastructure/wok-cfs/actions/workflows/build.yml)
+
 **Water Observation Kit — Lunar Seismic Survey & Ice Prospecting Rover**
 
 WOK is a simulated lunar rover mission you can build and fly on any Linux
-box. The flight software is six apps on NASA's core Flight System (cFS,
-Draco v7.0.0) that autonomously drive a rover between survey sites, fire a
-seismic source, record and pick first arrivals on a geophone array, decide
-onboard whether a site looks ice-bearing, and drill to confirm. All
-hardware access goes through a per-subsystem Hardware Abstraction Layer:
-the included `linux_sim` HAL implements a physics simulation (a shared
-subsurface geology model feeds both the seismic and drill instruments, so
-inversion algorithms can be validated against known ground truth), and a
-`flight_stub` HAL is the template for porting to real hardware. A ground
-console, web dashboard, and analysis tools complete the loop from command
-uplink to a ranked ice-prospect map.
+box. It is a simulation and educational project: nothing here is flight
+software or flight-qualified, and every number in it is a design
+assumption, not a measurement. The flight software is six apps on NASA's
+core Flight System (cFS, Draco v7.0.0) that autonomously drive a rover
+between survey sites, fire a seismic source, record and pick first
+arrivals on a geophone array, decide onboard whether a site looks
+ice-bearing, and drill to confirm. All hardware access goes through a
+per-subsystem Hardware Abstraction Layer: the included `linux_sim` HAL
+implements a physics simulation (a shared subsurface geology model feeds
+both the seismic and drill instruments, so inversion algorithms can be
+checked against the model's known ground truth), and a `flight_stub` HAL
+is the template for porting to real hardware. A ground console, web
+dashboard, and analysis tools complete the loop from command uplink to a
+ranked ice-prospect map.
 
 ## Quick Start
 
@@ -120,11 +125,11 @@ The sequencer orchestrates the mission via SeqId-gated commands to child apps. T
 
 **Navigation recalibration:** NAV dead-reckons in the start frame, and heading drift compounds across steps (each step's turn-back restores the *believed* heading, not the true one), degrading site stamps over a long traverse. Two ground commands close the loop: `nav.setpose <x> <y>` overwrites the pose with ground truth (bookkeeping only), and `nav.realign <error_deg>` executes a corrective in-place turn and re-declares the start-frame heading. A per-waypoint recal flag (`seq.loadwp … recal=1`) holds the mission after MOVE for a ground pass — released by `seq.release` or a wall-clock timeout, so unattended missions never deadlock. The sim models the error source (`WOK_SIM_TURN_BIAS_DEG`, unsensed per-turn heading bias, default 0).
 
-**Coupling & placement (WOK-CP-001):** in per-pod placement mode (`seq.placement 1`) the rover creates the survey aperture itself — DEPLOY becomes a placement sub-sequence (drive to each pod position, place, gate on the arm's seating-force proxy with bounded reseats), VERIFY fires a low-energy test shot that scores every pod's actual ground coupling (plate factor cancels) and drives targeted reseats, and STOW is the retrieval mirror with per-pod recapture confirmation. Coupling is a confirmed, measured condition — not an endstop event: per-pod scores, seat attempts, plate transfer metric, and sync/pick-consistency residuals are telemetered and archived per site (`coup_NNNN.wok`), and `wok_refraction.py` deweights low-coupling channels. The default fixed-array mode preserves legacy behavior exactly. Sim truth toggles: `WOK_SIM_COUPLING=1`, `WOK_SIM_SYNC_ERR_MS=<ms>`.
+**Coupling & placement:** in per-pod placement mode (`seq.placement 1`) the rover creates the survey aperture itself — DEPLOY becomes a placement sub-sequence (drive to each pod position, place, gate on the arm's seating-force proxy with bounded reseats), VERIFY fires a low-energy test shot that scores every pod's actual ground coupling (plate factor cancels) and drives targeted reseats, and STOW is the retrieval mirror with per-pod recapture confirmation. Coupling is a confirmed, measured condition — not an endstop event: per-pod scores, seat attempts, plate transfer metric, and sync/pick-consistency residuals are telemetered and archived per site (`coup_NNNN.wok`), and `wok_refraction.py` deweights low-coupling channels. The default fixed-array mode preserves legacy behavior exactly. Sim truth toggles: `WOK_SIM_COUPLING=1`, `WOK_SIM_SYNC_ERR_MS=<ms>`.
 
-Each site gets three stacked shots from a dual-mode EM source (capacitor-bank impulse by default, or a swept-sine pilot correlated onboard into an equivalent-impulse trace), recorded with a hardware-referenced electrical t₀, onboard STA/LTA first-break picks, and archived trace/stack files. Drill cycles log a full stiffness profile (depth, WOB, torque, ROP) and an evolved-gas curve (volatile ppm vs cell temperature — the release temperature classifies how the water is bound). Every product is stamped with the surveyed site pose, so co-located seismic + drill results form the calibration tie point the prospecting case rests on.
+Each site gets three stacked shots from a dual-mode EM source (capacitor-bank impulse by default, or a swept-sine pilot correlated onboard into an equivalent-impulse trace), recorded with a hardware-referenced electrical t₀, onboard STA/LTA first-break picks, and archived trace/stack files. Drill cycles log a drilling-response record (depth, WOB, torque, ROP) and an evolved-gas curve (volatile ppm vs cell temperature — the release temperature classifies how the water is bound). Every product is stamped with the surveyed site pose, so co-located seismic + drill results form the calibration tie point the prospecting case rests on.
 
-The drill decision itself is onboard geophysics: EVALUATE inverts the site's first-break picks for refractor velocity and layer depth, and flags the site on the Bayesian posterior that the refractor is ice-fast.
+The drill decision itself is onboard geophysics: EVALUATE inverts the site's first-break picks for refractor velocity and layer depth, and flags the site on the grid-posterior probability that the refractor is ice-cemented (Vp above 1200 m/s; "ice-fast" in the code). Four pods and three shots per site is simulation scale; a field survey would use 12–24 channels and reversed shots.
 
 **Mission modes & the tie-point gate:** `seq.mode 1` selects survey-first targeting — score every site, then return to the best and drill it. Waypoints are ground-uploadable (`seq.loadwp` / `seq.wpcount`). In any mode, a mission cannot end with zero drills: the sequencer returns to its best-scoring site for at least one calibration tie, because that tie is what anchors the Vp→ice transfer function `wok_refraction.py` fits and extrapolates across the whole survey (ranked prospect queue with CONFIRMED-vs-inferred labels).
 
@@ -151,7 +156,8 @@ Any critical fault triggers SAFE (NAV stop, GEO stow, SEIS stop, DRILL e-stop), 
 - `tools/wok_sim.sh` — one-command sim stack `up|down|status`.
 - `tools/wok_mission_tools.py` — scriptable mission commands, file fetch, pick validation against the sim's geology truth.
 - `tools/wok_regress.py` — regression comparison of two mission logs/product sets.
-- `tools/wok_src_harness.c` — standalone physics harness that compiles the sim HAL without cFS (build command in its header).
+- `tools/wok_src_harness.c` — standalone physics harness that compiles the sim HAL without cFS; `tools/run_src_harness.sh` builds and runs its verification modes.
+- `tools/smoke_test.sh` — boots a built cFS tree and checks all six apps initialise (what CI runs).
 
 ## Documentation
 
@@ -182,10 +188,12 @@ Allocated at topic offset 0xD0+ to avoid collisions with stock Draco apps (TO_LA
 coexist on one host — instance *i* runs at offset `i*100` (CI
 `1234+offset`, TLM `2234+offset`). Each instance also needs its own
 working directory (cFE keys SysV shared memory by `ftok()` on cwd files).
+`tools/wok_mission_tools.py` honours `AEGIS_PORT_OFFSET` (or `--host`,
+`--cmd-port`, `--tlm-port`) so it can drive a second instance.
 
 ## Status
 
-Verified end-to-end on cFS Draco v7.0.0 (the `v7.0.0` bundle tag), Ubuntu/Pop!_OS Linux, with the `linux_sim` HAL — including full simulated missions: 7 survey sites, fold-3 stacks at 99% coherence, 28/28 onboard first-break picks within 0.3 ms of the sim's subsurface truth model, two drill cycles whose volatile readings match the seismic evaluate at the same sites, and byte-verified file downlinks. The sim HAL derives both instruments from a single shared geology model — extended with per-position ground-coupling and per-pod clock-error truth — so inversion/fusion algorithms *and* the reseat/verification choreography can be validated against known ground truth: placement missions reproduce coupling draws to the displayed digit, and pick error at the ±0.2 ms RF-sync budget measures within the ±0.5 ms spec. Every capability epoch is regression-gated against the archived v4.0 baseline (identical state transitions, 0.00 ms pick deltas). The flight HAL is stubbed — see the [HAL Porting Guide](docs/WOK_HAL_Porting_Guide.md) to wire real hardware; the per-pod GetStrikeInfo contract evolution (wireless pods) is the flagged porting-time debt.
+Verified on cFS Draco v7.0.0 (the `v7.0.0` bundle tag) on Ubuntu-family Linux with the `linux_sim` HAL. The stock seven-site mission runs to DONE in about 12 minutes, drills twice, and the ground analysis recovers the simulator's buried ice lens at the right site and concentration. First-break picks land within one sample (0.25 ms) of the model's arrival times, which is a self-consistency check of the signal chain rather than a fidelity claim: the signal and the truth come from the same model. The flight HAL is a stub; the [HAL Porting Guide](docs/WOK_HAL_Porting_Guide.md) describes what real hardware has to provide, including the per-pod timing contract that wireless geophones would need.
 
 ## License
 

@@ -1,8 +1,8 @@
 # WOK Simulation Model Specification
 
-**Document:** WOK-SM-001
-**Version:** 1.2 (matches FSW v5.0 + CP-1…CP-5: coupling, per-pod placement, and sync truth models)
-**Date:** July 2026
+**Document:** WOK-SM-001  
+**Version:** 1.3 (FSW 5.0)  
+**Date:** October 2026  
 **Scope:** `apps/wok_common/hal/src/linux_sim/` — every function and equation
 the Linux sim uses to synthesize the signals the flight software would
 receive from bench or flight hardware. This is the reference for (a) knowing
@@ -34,6 +34,10 @@ source file unless marked as platform config (`wok_platform_cfg.h`).
 - **Determinism:** every geology-derived quantity is a pure function of
   (x, y, depth), so all app-local HAL copies agree without shared memory.
   Randomness rides *on top of* deterministic truth, never inside it.
+- **Thermal ambients are Earth-bench values** (25 °C cell, 28/35 °C
+  battery), not lunar. The sim is a desktop stand-in for a bench test.
+- **"ppm" is by mass of sample** (ppmw: µg of H₂O-equivalent per g of
+  regolith; 1 wt% = 10⁴ ppmw), never a gas mixing ratio.
 
 ---
 
@@ -81,14 +85,28 @@ CDFs approximating Gaussian release peaks:
 ```
 cdf(T; µ, σ) = 1 / (1 + exp(−(T − µ)/(0.6σ)))
 
-evolved(T)/total = f_ads·cdf(T; 110, 20) + f_pore·cdf(T; 160, 25)
+evolved(T)/total = f_pore·cdf(T; 100, 20) + f_ads·cdf(T; 160, 30)
                  + f_hyd·cdf(T; 320, 30)
 ```
-Partition: adsorbed component = min(total, 0.003 wt%) (the background
-film); the lens-derived remainder splits 85% pore ice / 15% hydrated
-mineral. The hydrated peak (320 °C) sits above the 300 °C cell limit by
-design — the vapor cell under-recovers it (~10–11%), and ground processing
-must recover the hidden tail from the release-curve fit.
+The modes are ordered by binding energy, as in a thermogravimetric /
+evolved-gas sequence: free (pore) ice evaporates first, around the boiling
+point at cell pressure; physisorbed films desorb above that; structurally
+bound water (hydrated minerals) needs 300 °C and more. Partition: adsorbed
+component = min(total, 0.003 wt%) (the background film); the lens-derived
+remainder splits 85% pore ice / 15% hydrated mineral. The hydrated peak
+(320 °C) sits above the 300 °C cell limit by design — the vapor cell
+under-recovers it (~10–11%), and ground processing must recover the hidden
+tail from the release-curve fit. The sim cell is sealed and starts at
+bench ambient (25 °C), so nothing evolves before the ramp; a vented flight
+cell would lose free ice below 0 °C during warm-up, so cold-loading and
+sealing before the ramp is a flight requirement (§11).
+
+**Velocities are deliberately stiffer than Apollo.** The Apollo 14/16
+active seismic experiments found ~100 m/s regolith over ~300 m/s to about
+8 m; Apollo 17 LSPE found ~250 m/s to >100 m over ~1.2 km/s basalt. The
+sim's 250 / 800 / 3200 m/s column is chosen so the direct and head-wave
+branches separate cleanly on a 6 m spread; a polar site is unsurveyed.
+Replace with site data.
 
 **Bench calibration:** replace the layer table and lens with site survey /
 lab core data; replace release-mode (µ, σ) with TGA/EGA lab calibration of
@@ -114,21 +132,27 @@ by the QC thresholds: clip at ±7,950,000 ≈ 95% FS).
 val = n(s) + A_ch · g(t − t₀ − t_arr(ch))          for t ≥ t₀ + t_arr, else n(s)
 
 n(s)  = U(−80, +80) counts                          (broadband noise floor)
-A_ch  = F · 40000 / (x_ch² + 1)   counts            (source coupling + spreading)
+A_ch  = F · 40 / (x_ch² + 1)   counts               (source coupling + spreading)
 ```
 - `F` = shot peak plate force [N] (§4), `x_ch` = pod offset [m].
-- `40000 counts/N at 1 m` is the lumped plate-to-ground coupling ×
-  geophone sensitivity × ADC gain constant.
+- `40 counts/N at 1 m` is the lumped plate-to-ground coupling ×
+  geophone sensitivity × ADC gain constant (an 8.5 kN strike gives
+  ~105 k counts at the 1.5 m pod, ~9 k counts at 6 m, on a 24-bit ADC
+  with an 80-count noise floor).
 - Geometric spreading `1/(x²+1)`: body-wave-like 1/x² softened to avoid the
   singularity at zero offset. No per-branch (direct vs head wave)
   amplitude difference is modeled.
 
 **Impulse response wavelet** (mode = IMPULSE):
 ```
-g(dt) = exp(−dt/τ) · sin(2π·f_c·dt),   f_c = 25 Hz,  τ = 0.15 s
+g(dt) = exp(−dt/τ) · sin(2π·f_c·dt),   f_c = 400 Hz,  τ = 12 ms
 ```
 A causal damped sine — the minimum-phase stand-in for source-plate +
-shallow-ground response.
+shallow-ground response. 400 Hz is a ~0.6 m wavelength at v₁ = 250 m/s,
+short against the 1.5 m layer and the 1.5–6 m spread, and sits inside the
+100–1600 Hz sweep band (§5); the coda is ~4τ ≈ 50 ms. The onset is a
+mathematical step at t_arr, so first-break picks against this wavelet are
+exact by construction (§11).
 
 **Sweep response** (mode = SWEEP): ground motion is the *contract pilot*
 delayed by the arrival time (i.e., the pilot convolved with a single-spike
@@ -183,20 +207,20 @@ SOC%   = 100 · E / target_J
 ```
 
 **Impulse plate force** (discharge → strike). Impulse-momentum scaling:
-peak force ∝ √(stored energy), anchored so the default reproduces the
-v4.0 drop-weight:
+peak force ∝ √(stored energy). A 50 J strike delivered over ~1 ms is a
+~7 N·s impulse and a kN-class peak, as for any hammer-and-plate source:
 ```
-F = 8.5 · sqrt(E/50 J) + U(0, 1)   [N]     (8.5–9.5 N at the 50 J default)
+F = 8500 · sqrt(E/50 J) + U(0, 1000)   [N]     (8.5–9.5 kN at the 50 J default)
 ```
-**Charging time** at default energy = 50 J / 50 W = 1.0 s — matching the
-old drop-weight's 1 s lift, which keeps mission timing regression-tight.
+**Charging time** at default energy = 50 J / 50 W = 1.0 s.
 
-**Sweep drive:** regulated (force-limited) at `F = 0.02 N` for the pilot
+**Sweep drive:** regulated (force-limited) at `F = 20 N` for the pilot
 duration; `sweep_progress = elapsed/T_sweep`; FIRED when complete. The
-0.02 N value is a *tuned* constant (see §5) chosen so per-shot arrivals sit
+20 N value is a *tuned* constant (see §5) chosen so per-shot arrivals sit
 at the noise floor (raw SNR ≈ 3 at the near pod) and only emerge in
-correlation — both physically representative of force-limited sources and
-required for onset-picker compatibility of the correlated wavelet.
+correlation — both physically representative of small force-limited
+vibrators and required for onset-picker compatibility of the correlated
+wavelet.
 
 **Bench calibration:** charge power curve vs bus voltage (replace the
 step inhibit with the real charger foldback), C and residual-after-fire,
@@ -238,10 +262,11 @@ L   = round(2.5/(f₁ − f₀) · fs)     (WOK_SEIS_CORR_LEAD_FRAC: delays the
                                      energy onset reads causal — aligned
                                      with impulse onsets — to the picker)
 ```
-The `(taper = 0.5, F_sweep = 0.02 N, G = 32, lead = 2.5)` set is
+The `(taper = 0.5, F_sweep = 20 N, G = 32, lead = 2.5)` set is
 **harness-tuned as a unit** (`tools/wok_src_harness.c`): impulse-vs-sweep
-pick agreement within ±0.25 ms at every pod across 8 noise seeds (spec
-±0.5 ms). Changing any one requires re-running the harness.
+pick agreement within the ±0.5 ms pick spec at every pod across 8 noise
+seeds (typically one 0.25 ms sample). Changing any one requires re-running
+the harness.
 
 **Bench calibration:** capture the emitted pilot with a reference
 accelerometer on the plate and cross-correlate against the analytic pilot —
@@ -250,7 +275,7 @@ constant against bench impulse-vs-sweep shot pairs.
 
 ---
 
-## 6. Drill (penetration, stiffness log, thermal volatile analysis)
+## 6. Drill (penetration, drilling-response log, thermal volatile analysis)
 
 `wok_hal_sim_drill.c`. All material terms come from geology strength/ice
 at (site, current bit depth) — the drill "measures" the same ground truth
@@ -263,10 +288,11 @@ the seismic sim radiates.
 ```
 d(depth)/dt = 0.04 / S(x, y, depth)   [m/s],   S = geology strength (≥ 1)
 ```
-(0.04 m/s dry-regolith base rate is sim-compressed ~10× for demo pacing;
-strength contrast, not absolute rate, is the fidelity claim.)
+(0.04 m/s dry-regolith base rate is sim-compressed ~100× for demo pacing —
+planetary drills advance centimetres per minute; strength contrast, not
+absolute rate, is the fidelity claim.)
 
-**Stiffness log channels while drilling:**
+**Drilling-response channels while drilling:**
 ```
 torque  = 0.5·S + U(−0.1, 0.1) + 0.6·[5% chance]   [N·m]  (bit-bind spikes)
 WOB     = 100 + 20·S + U(−5, 5)                     [N]
@@ -278,6 +304,8 @@ Ground processing uses a *median* torque baseline specifically because the
 
 **Thermal vaporization cycle:** heat 5 °C/s from 25 °C to 300 °C → hold
 10 s ("ANALYZE") → cool 3 °C/s to ambient. Cell temp telemetry ±0.5 °C.
+The heat/cool durations carried by START_SAMPLE are recorded but not used
+by the sim; these rates govern.
 
 **Evolved-gas measurement** during heat/hold (the binding-classification
 signal): with `total_ppm = 10000 · w(x, y, depth_latched)` (1 wt% = 10⁴ ppm,
@@ -285,7 +313,7 @@ depth latched at StartSample for depth registration):
 ```
 ppm(T)  = total_ppm · evolved(T)/total          (§2 release spectrum)
           + U(−(0.02·ppm + 2), +(0.02·ppm + 2))          (2% + 2 ppm noise)
-P_vapor = 3.6·(T − 25) + 0.01·ppm + U(−2, 2)    [Pa]
+P_vapor = 3.6·(T − 25) + 0.01·ppm + U(−2, 2)    [Pa]   (+U(−5, 5) during the hold)
 ```
 The logged (T, ppm) ramp *is* the release curve; at the 300 °C limit the
 hydrated mode is only partially evolved (intentional under-recovery).
@@ -502,6 +530,22 @@ measured RF-sync/clock-discipline statistics replace the uniform bias.
    changes the waveform (low-pass, resonant ringing) and couples noise
    differently; spectral-coherence coupling scores will need that
    structure once bench data defines it.
+9. **Flat-layer forward model, single-ended spread.** The interface
+   undulation (§2) dips up to ~11°, but traveltimes use h₁ at the shot
+   point and the flat-layer formula, and there is no reverse shot. In
+   the field, v₂ from an unreversed 4-pod spread is an apparent velocity
+   and h₁ is known only under the source; the sim does not expose that
+   error. Reversed shots (or a second source position) are the standard
+   remedy and are a mission-design item, not a sim fix.
+10. **First-break picks are exact by construction.** The impulse wavelet
+   is a damped sine whose onset is a step at t_arr, and the near-pod SNR
+   is ~10³, so the ±0.3 ms pick agreement quoted elsewhere is a
+   self-consistency check of the signal chain, not a fidelity claim.
+   Real onsets are emergent and band-limited.
+11. **Sealed, bench-ambient vapor cell.** The sample starts at 25 °C and
+   nothing evolves before the ramp. A vented cell in vacuum would lose
+   free ice below 0 °C during warm-up; cold-loading and sealing before
+   the ramp is a flight requirement.
 
 ---
 
@@ -519,8 +563,8 @@ model change must preserve them:
 - Drill-measured interface (torque step) within ~0.25 m of h₁(x,y); vapor
   totals within ~0.1% of 10⁴·w(x,y,depth) after ground release-curve
   recovery (`ground/wok_refraction.py` vs truth).
-- Sequencer mission timing insensitive to the source swap: 50 J default
-  charge time (1.0 s) ≡ v4.0 drop-weight lift time.
+- Sequencer mission timing: the 50 J default charge time (1.0 s) is the
+  value the sequencer's arm timeout was set against.
 - Sync (§10, `wok_src_harness.c sync` mode): measured pick shift under
   injected bias matches ε_p within the 0.25 ms sample quantum; at the
   ±0.2 ms RF-sync budget the worst |pick − truth| stays within the

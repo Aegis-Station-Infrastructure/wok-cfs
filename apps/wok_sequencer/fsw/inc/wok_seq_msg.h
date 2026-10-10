@@ -63,9 +63,9 @@ typedef struct
 } WOK_Seq_SetModeCmd_t;
 
 /* Upload/replace one waypoint (ground retargeting). SourceMode +
- * SourceEnergyJ let ground command the seismic source per site
- * (v5.0); RecalFlag holds after MOVE for ground recalibration (nav
- * recal epoch). Zeros preserve prior behavior exactly. */
+ * SourceEnergyJ let ground command the seismic source per site;
+ * RecalFlag holds after MOVE for ground recalibration. Zeros select
+ * the defaults (impulse at the app energy, no hold). */
 typedef struct
 {
     CFE_MSG_CommandHeader_t CmdHeader;
@@ -122,12 +122,17 @@ typedef struct
     uint16  TotalWaypoints;
     uint16  FaultMask;
     uint16  Spare;
-    /* Targeting status (appended v4.0) */
+    /* Targeting status (appended — prefix decoders keep working) */
     uint8   MissionMode;        /* WOK_SEQ_MODE_*                     */
     uint8   DrillsCompleted;    /* tie-point gate progress            */
     uint8   BestSiteIdx;        /* argmax-score waypoint (0xFF none)  */
     uint8   SpareT;
     float   BestSiteScore;      /* its EvalIceFrac                    */
 } WOK_Seq_ModeTlm_t;
+
+/* Ground decoders unpack these at fixed offsets — catch layout drift at
+ * compile time (sizes include the 16-byte telemetry header). */
+CompileTimeAssert(sizeof(WOK_Seq_HkTlm_t)   == 28, WOK_Seq_HkTlm_t_WrongSize);
+CompileTimeAssert(sizeof(WOK_Seq_ModeTlm_t) == 32, WOK_Seq_ModeTlm_t_WrongSize);
 
 #endif /* WOK_SEQ_MSG_H */

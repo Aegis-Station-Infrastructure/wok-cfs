@@ -1,0 +1,7 @@
+# Copyright 2026 Aegis Station Infrastructure LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Ground-tool dependencies (Python 3.10+). Only the WebSocket bridge
+# needs a third-party package; the console and the processing tools
+# are standard library only.
+websockets>=10

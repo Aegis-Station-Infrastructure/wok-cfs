@@ -67,4 +67,8 @@ typedef struct
     uint8   Spare[3];
 } WOK_Hk_HealthTlm_t;
 
+/* Ground decoders unpack this at fixed offsets — catch layout drift at
+ * compile time (size includes the 16-byte telemetry header). */
+CompileTimeAssert(sizeof(WOK_Hk_HealthTlm_t) == 52, WOK_Hk_HealthTlm_t_WrongSize);
+
 #endif /* WOK_HK_MSG_H */

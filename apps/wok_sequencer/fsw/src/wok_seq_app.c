@@ -5,19 +5,10 @@
 /************************************************************************
 * WOK_SEQ — Mission Sequencer / State Machine
 *
-* v2.4 — Survey geometry + strike-in-window:
-*   - NAV pose snapshotted on DEPLOY entry; stamped into SEIS StartAcq
-*     and DRILL StartDrill (site context for the tie-point products).
-*   - Acquisition now starts on THUMP entry so the strike lands INSIDE
-*     the record window (pre-trigger); RECORD waits for completion.
-*     Firing before recording (old order) left no strike energy in the
-*     trace and made t0 sync meaningless.
-*
-* v2.2 — Timing fixes:
-*   - State machine only runs on SEND_HK ticks, not on every child
-*     TLM packet. Child TLM updates cached data only.
-*   - Source reset on THUMP entry ensures clean state.
-*   - Source-cycle timeout is wall-clock (WOK_SEQ_SOURCE_TIMEOUT_SEC).
+* Drives the per-waypoint survey loop by commanding the child apps over
+* the SB and gating each transition on their SeqId-echoed status TLM.
+* The state machine runs only on SEND_HK ticks; child TLM just refreshes
+* the cached status. All timeouts are wall-clock (CFE_TIME).
 *
 * Ops loop (VERIFY only in placement mode; HOLD only at recal-flagged
 * waypoints):
@@ -58,15 +49,16 @@ void WOK_Seq_AppMain(void)
     CFE_SB_Buffer_t *BufPtr = NULL;
 
     CFE_ES_PerfLogEntry(WOK_SEQ_PERF_ID);
+    WOK_Seq_AppData.RunStatus = CFE_ES_RunStatus_APP_RUN;
     Status = WOK_Seq_AppInit();
     if (Status != CFE_SUCCESS)
     {
         CFE_ES_WriteToSysLog("WOK_SEQ: Init failed (0x%08lX)\n",
                              (unsigned long)Status);
-        return;
+        WOK_Seq_AppData.RunStatus = CFE_ES_RunStatus_APP_ERROR;
     }
 
-    while (true)
+    while (CFE_ES_RunLoop(&WOK_Seq_AppData.RunStatus) == true)
     {
         CFE_ES_PerfLogExit(WOK_SEQ_PERF_ID);
         Status = CFE_SB_ReceiveBuffer(&BufPtr, WOK_Seq_AppData.CmdPipe,
@@ -78,12 +70,13 @@ void WOK_Seq_AppMain(void)
         else
         {
             CFE_EVS_SendEvent(WOK_SEQ_PIPE_ERR_EID, CFE_EVS_EventType_ERROR,
-                              "WOK_SEQ: SB pipe error (0x%08lX)",
+                              "WOK_SEQ: SB pipe error (0x%08lX), app will exit",
                               (unsigned long)Status);
-            break;
+            WOK_Seq_AppData.RunStatus = CFE_ES_RunStatus_APP_ERROR;
         }
     }
-    CFE_ES_ExitApp(CFE_ES_RunStatus_APP_ERROR);
+    CFE_ES_PerfLogExit(WOK_SEQ_PERF_ID);
+    CFE_ES_ExitApp(WOK_Seq_AppData.RunStatus);
 }
 
 /* ================================================================== */
@@ -98,14 +91,30 @@ int32 WOK_Seq_AppInit(void)
                                 WOK_SEQ_PIPE_DEPTH, WOK_SEQ_PIPE_NAME);
     if (Status != CFE_SUCCESS) return Status;
 
-    /* Subscribe */
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_SEQ_CMD_MID),          WOK_Seq_AppData.CmdPipe);
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_SEQ_SEND_HK_MID),     WOK_Seq_AppData.CmdPipe);
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_NAV_STATUS_TLM_MID),   WOK_Seq_AppData.CmdPipe);
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_GEO_STATUS_TLM_MID),   WOK_Seq_AppData.CmdPipe);
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_SEIS_STATUS_TLM_MID),  WOK_Seq_AppData.CmdPipe);
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_HK_TLM_MID),          WOK_Seq_AppData.CmdPipe);
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_DRILL_HK_TLM_MID),    WOK_Seq_AppData.CmdPipe);
+    /* Subscribe: own command + wakeup, then the five child TLM streams */
+    {
+        static const struct { uint32 Mid; const char *Name; } Subs[] = {
+            { WOK_SEQ_CMD_MID,         "CMD"         },
+            { WOK_SEQ_SEND_HK_MID,     "SEND_HK"     },
+            { WOK_NAV_STATUS_TLM_MID,  "NAV status"  },
+            { WOK_GEO_STATUS_TLM_MID,  "GEO status"  },
+            { WOK_SEIS_STATUS_TLM_MID, "SEIS status" },
+            { WOK_HK_TLM_MID,          "HK health"   },
+            { WOK_DRILL_HK_TLM_MID,    "DRILL HK"    },
+        };
+        for (size_t i = 0; i < sizeof(Subs) / sizeof(Subs[0]); i++)
+        {
+            Status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(Subs[i].Mid),
+                                      WOK_Seq_AppData.CmdPipe);
+            if (Status != CFE_SUCCESS)
+            {
+                CFE_EVS_SendEvent(WOK_SEQ_SUB_ERR_EID, CFE_EVS_EventType_ERROR,
+                                  "WOK_SEQ: Subscribe to %s failed (0x%08lX)",
+                                  Subs[i].Name, (unsigned long)Status);
+                return Status;
+            }
+        }
+    }
 
     /* Init TLM headers */
     CFE_MSG_Init(CFE_MSG_PTR(WOK_Seq_AppData.HkTlm.TlmHeader),
@@ -183,7 +192,7 @@ int32 WOK_Seq_AppInit(void)
     CFE_MSG_Init(CFE_MSG_PTR(WOK_Seq_AppData.DrillDeployCmd.CmdHeader),
                  CFE_SB_ValueToMsgId(WOK_DRILL_CMD_MID), sizeof(WOK_Drill_DeployArmCmd_t));
     CFE_MSG_SetFcnCode(CFE_MSG_PTR(WOK_Seq_AppData.DrillDeployCmd.CmdHeader), WOK_DRILL_DEPLOY_ARM_CC);
-    WOK_Seq_AppData.DrillDeployCmd.TargetAngleDeg = WOK_DRILL_DEFAULT_ANGLE_DEG;
+    WOK_Seq_AppData.DrillDeployCmd.TargetAngleDeg = WOK_DRILL_DEFAULT_ARM_ANGLE_DEG;
 
     CFE_MSG_Init(CFE_MSG_PTR(WOK_Seq_AppData.DrillStowCmd.CmdHeader),
                  CFE_SB_ValueToMsgId(WOK_DRILL_CMD_MID), sizeof(WOK_Drill_NoopCmd_t));
@@ -211,7 +220,6 @@ int32 WOK_Seq_AppInit(void)
     WOK_Seq_AppData.EnteredState     = true;
     WOK_Seq_AppData.WaypointIdx      = 0;
     WOK_Seq_AppData.LoopCount        = 0;
-    WOK_Seq_AppData.RetryCount       = 0;
     WOK_Seq_AppData.FaultMask        = WOK_FAULT_NONE;
     WOK_Seq_AppData.CmdCounter       = 0;
     WOK_Seq_AppData.ErrCounter       = 0;
@@ -239,6 +247,11 @@ int32 WOK_Seq_AppInit(void)
     WOK_Seq_AppData.ReturnTargetIdx  = 0;
     for (int i = 0; i < WOK_SEQ_MAX_WAYPOINTS; i++)
         WOK_Seq_AppData.SiteScore[i] = -1.0f;
+    WOK_Seq_AppData.NavTlmLenErrReported   = 0;
+    WOK_Seq_AppData.GeoTlmLenErrReported   = 0;
+    WOK_Seq_AppData.SeisTlmLenErrReported  = 0;
+    WOK_Seq_AppData.HkTlmLenErrReported    = 0;
+    WOK_Seq_AppData.DrillTlmLenErrReported = 0;
 
     /* Load waypoint table */
     WOK_Seq_AppData.TotalWaypoints = WOK_SEQ_NUM_WAYPOINTS;
@@ -258,7 +271,7 @@ int32 WOK_Seq_AppInit(void)
     WOK_Seq_AppData.SeisStartCmd.ChannelMask   = 0x0F;
 
     CFE_EVS_SendEvent(WOK_SEQ_INIT_INF_EID, CFE_EVS_EventType_INFORMATION,
-                      "WOK_SEQ: App initialised (v2.3.0-seqid) — %u waypoints loaded",
+                      "WOK_SEQ: App initialised (v" WOK_VERSION_STRING ") — %u waypoints loaded",
                       WOK_Seq_AppData.TotalWaypoints);
 
     return CFE_SUCCESS;
@@ -417,8 +430,10 @@ void WOK_Seq_SendDrillEstop(void)    { WOK_Seq_AppData.DrillEstopCmd.SeqId    = 
 
 /* ================================================================== */
 /*  Packet dispatcher                                                 */
-/*  KEY FIX: State machine ONLY runs on SEND_HK (1 Hz).              */
-/*  Child TLM updates cached data but does NOT run the state machine. */
+/*  The state machine runs ONLY on SEND_HK — on each SEND_HK tick     */
+/*  (~25 Hz with the stock SCH_LAB table; platform-dependent, which   */
+/*  is why every timeout below is wall-clock). Child TLM updates the  */
+/*  cached data but does NOT run the state machine.                   */
 /* ================================================================== */
 void WOK_Seq_ProcessCommandPacket(CFE_SB_Buffer_t *BufPtr)
 {
@@ -433,24 +448,35 @@ void WOK_Seq_ProcessCommandPacket(CFE_SB_Buffer_t *BufPtr)
 
         case WOK_SEQ_SEND_HK_MID:
             WOK_Seq_ReportHousekeeping();
-            WOK_Seq_RunStateMachine(BufPtr);   /* ← ONLY place SM runs */
+            WOK_Seq_RunStateMachine();   /* ← ONLY place SM runs */
             break;
 
-        /* Child TLM — cache data only, do NOT run state machine */
+        /* Child TLM — length-checked, then cached; do NOT run the state
+         * machine. A short/long packet is dropped (never partially copied). */
         case WOK_NAV_STATUS_TLM_MID:
-            memcpy(&WOK_Seq_AppData.NavStatus, BufPtr, sizeof(WOK_Nav_StatusTlm_t));
+            if (WOK_Seq_VerifyTlmLength(BufPtr, sizeof(WOK_Nav_StatusTlm_t),
+                                        &WOK_Seq_AppData.NavTlmLenErrReported))
+                memcpy(&WOK_Seq_AppData.NavStatus, BufPtr, sizeof(WOK_Nav_StatusTlm_t));
             break;
         case WOK_GEO_STATUS_TLM_MID:
-            memcpy(&WOK_Seq_AppData.GeoStatus, BufPtr, sizeof(WOK_Geo_StatusTlm_t));
+            if (WOK_Seq_VerifyTlmLength(BufPtr, sizeof(WOK_Geo_StatusTlm_t),
+                                        &WOK_Seq_AppData.GeoTlmLenErrReported))
+                memcpy(&WOK_Seq_AppData.GeoStatus, BufPtr, sizeof(WOK_Geo_StatusTlm_t));
             break;
         case WOK_SEIS_STATUS_TLM_MID:
-            memcpy(&WOK_Seq_AppData.SeisStatus, BufPtr, sizeof(WOK_Seis_StatusTlm_t));
+            if (WOK_Seq_VerifyTlmLength(BufPtr, sizeof(WOK_Seis_StatusTlm_t),
+                                        &WOK_Seq_AppData.SeisTlmLenErrReported))
+                memcpy(&WOK_Seq_AppData.SeisStatus, BufPtr, sizeof(WOK_Seis_StatusTlm_t));
             break;
         case WOK_HK_TLM_MID:
-            memcpy(&WOK_Seq_AppData.HkHealth, BufPtr, sizeof(WOK_Hk_HealthTlm_t));
+            if (WOK_Seq_VerifyTlmLength(BufPtr, sizeof(WOK_Hk_HealthTlm_t),
+                                        &WOK_Seq_AppData.HkTlmLenErrReported))
+                memcpy(&WOK_Seq_AppData.HkHealth, BufPtr, sizeof(WOK_Hk_HealthTlm_t));
             break;
         case WOK_DRILL_HK_TLM_MID:
-            memcpy(&WOK_Seq_AppData.DrillHk, BufPtr, sizeof(WOK_Drill_HkTlm_t));
+            if (WOK_Seq_VerifyTlmLength(BufPtr, sizeof(WOK_Drill_HkTlm_t),
+                                        &WOK_Seq_AppData.DrillTlmLenErrReported))
+                memcpy(&WOK_Seq_AppData.DrillHk, BufPtr, sizeof(WOK_Drill_HkTlm_t));
             break;
 
         default:
@@ -474,7 +500,7 @@ void WOK_Seq_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
             {
                 WOK_Seq_AppData.CmdCounter++;
                 CFE_EVS_SendEvent(WOK_SEQ_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
-                                  "WOK_SEQ: NOOP (v2.3.0-seqid)");
+                                  "WOK_SEQ: NOOP (v" WOK_VERSION_STRING ")");
             }
             break;
 
@@ -492,7 +518,6 @@ void WOK_Seq_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                 WOK_Seq_AppData.CmdCounter++;
                 WOK_Seq_AppData.WaypointIdx  = 0;
                 WOK_Seq_AppData.LoopCount    = 0;
-                WOK_Seq_AppData.RetryCount   = 0;
                 WOK_Seq_AppData.FaultMask    = WOK_FAULT_NONE;
                 WOK_Seq_AppData.EvalFlag     = 0;
                 WOK_Seq_AppData.DrillsCompleted = 0;
@@ -536,7 +561,6 @@ void WOK_Seq_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                 if (WOK_Seq_AppData.State == WOK_STATE_SAFE)
                 {
                     WOK_Seq_AppData.CmdCounter++;
-                    WOK_Seq_AppData.RetryCount = 0;
                     WOK_Seq_AppData.FaultMask  = WOK_FAULT_NONE;
                     /* Drop cached child-app statuses so stale FaultMask bits
                      * from before the abort don't immediately re-trigger SAFE
@@ -562,8 +586,18 @@ void WOK_Seq_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
             if (WOK_Seq_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Seq_SetWaypointCmd_t)))
             {
                 WOK_Seq_SetWaypointCmd_t *Cmd = (WOK_Seq_SetWaypointCmd_t *)BufPtr;
-                WOK_Seq_AppData.CmdCounter++;
-                WOK_Seq_AppData.WaypointIdx = Cmd->WaypointIdx;
+                if (Cmd->WaypointIdx < WOK_Seq_AppData.TotalWaypoints)
+                {
+                    WOK_Seq_AppData.CmdCounter++;
+                    WOK_Seq_AppData.WaypointIdx = Cmd->WaypointIdx;
+                }
+                else
+                {
+                    WOK_Seq_AppData.ErrCounter++;
+                    CFE_EVS_SendEvent(WOK_SEQ_CMD_ERR_EID, CFE_EVS_EventType_ERROR,
+                                      "WOK_SEQ: SET_WAYPOINT %u rejected — %u waypoints active",
+                                      Cmd->WaypointIdx, WOK_Seq_AppData.TotalWaypoints);
+                }
             }
             break;
 
@@ -575,7 +609,7 @@ void WOK_Seq_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                 {
                     WOK_Seq_AppData.CmdCounter++;
                     WOK_Seq_AppData.MissionMode = Cmd->Mode;
-                    CFE_EVS_SendEvent(WOK_SEQ_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
+                    CFE_EVS_SendEvent(WOK_SEQ_MODE_SET_EID, CFE_EVS_EventType_INFORMATION,
                                       "WOK_SEQ: Mission mode = %s",
                                       Cmd->Mode == WOK_SEQ_MODE_SURVEY_FIRST
                                           ? "SURVEY_FIRST" : "DRILL_INLINE");
@@ -602,7 +636,7 @@ void WOK_Seq_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                     wp->SourceMode    = Cmd->SourceMode;
                     wp->SourceEnergyJ = Cmd->SourceEnergyJ;
                     wp->RecalFlag     = Cmd->RecalFlag;
-                    CFE_EVS_SendEvent(WOK_SEQ_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
+                    CFE_EVS_SendEvent(WOK_SEQ_WP_LOADED_EID, CFE_EVS_EventType_INFORMATION,
                                       "WOK_SEQ: WP %u loaded — (%.1f, %.1f) drill=%u src=%s E=%.0fJ recal=%u",
                                       Cmd->WaypointIdx,
                                       (double)Cmd->DeltaForwardM,
@@ -625,7 +659,7 @@ void WOK_Seq_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                 {
                     WOK_Seq_AppData.CmdCounter++;
                     WOK_Seq_AppData.PlacementMode = Cmd->Placement;
-                    CFE_EVS_SendEvent(WOK_SEQ_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
+                    CFE_EVS_SendEvent(WOK_SEQ_PLACEMENT_SET_EID, CFE_EVS_EventType_INFORMATION,
                                       "WOK_SEQ: Placement mode = %s",
                                       Cmd->Placement == WOK_SEQ_PLACEMENT_PER_POD
                                           ? "PER_POD" : "FIXED_ARRAY");
@@ -644,7 +678,7 @@ void WOK_Seq_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                 {
                     WOK_Seq_AppData.CmdCounter++;
                     WOK_Seq_AppData.HoldRelease = 1;
-                    CFE_EVS_SendEvent(WOK_SEQ_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
+                    CFE_EVS_SendEvent(WOK_SEQ_RELEASE_EID, CFE_EVS_EventType_INFORMATION,
                                       "WOK_SEQ: Recalibration hold released by ground");
                 }
                 else
@@ -664,7 +698,7 @@ void WOK_Seq_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                 {
                     WOK_Seq_AppData.CmdCounter++;
                     WOK_Seq_AppData.TotalWaypoints = Cmd->Count;
-                    CFE_EVS_SendEvent(WOK_SEQ_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
+                    CFE_EVS_SendEvent(WOK_SEQ_WP_COUNT_EID, CFE_EVS_EventType_INFORMATION,
                                       "WOK_SEQ: Waypoint count = %u", Cmd->Count);
                 }
                 else
@@ -755,9 +789,11 @@ static void WOK_Seq_AdvanceWaypoint(void)
 }
 
 /* ================================================================== */
-/*  THE STATE MACHINE — runs at 1 Hz (SEND_HK only)                  */
+/*  THE STATE MACHINE — runs on each SEND_HK tick (~25 Hz with the     */
+/*  stock SCH_LAB table; platform-dependent). Nothing here counts     */
+/*  ticks as time: every timeout is wall-clock via CFE_TIME.          */
 /* ================================================================== */
-void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
+void WOK_Seq_RunStateMachine(void)
 {
     WOK_Seq_CheckSafetyInhibits();
     if (WOK_Seq_AppData.FaultMask != WOK_FAULT_NONE &&
@@ -829,7 +865,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                 WOK_Seq_AppData.EnteredState  = false;
                 WOK_Seq_AppData.HoldRelease   = 0;
                 WOK_Seq_AppData.HoldEntryTime = CFE_TIME_GetTime();
-                CFE_EVS_SendEvent(WOK_SEQ_STATE_CHANGE_EID, CFE_EVS_EventType_INFORMATION,
+                CFE_EVS_SendEvent(WOK_SEQ_HOLD_ENTRY_EID, CFE_EVS_EventType_INFORMATION,
                                   "WOK_SEQ: Holding at WP %u for ground recalibration "
                                   "(RELEASE to proceed; auto-proceed in %us)",
                                   WOK_Seq_AppData.WaypointIdx,
@@ -838,7 +874,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
             if (WOK_Seq_AppData.HoldRelease)
             {
                 WOK_Seq_AppData.HoldRelease = 0;
-                CFE_EVS_SendEvent(WOK_SEQ_CYCLE_COMPLETE_EID, CFE_EVS_EventType_INFORMATION,
+                CFE_EVS_SendEvent(WOK_SEQ_HOLD_RELEASED_EID, CFE_EVS_EventType_INFORMATION,
                                   "WOK_SEQ: Hold released at WP %u — proceeding",
                                   WOK_Seq_AppData.WaypointIdx);
                 WOK_Seq_ChangeState(WOK_STATE_DEPLOY);
@@ -850,7 +886,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                                       WOK_Seq_AppData.HoldEntryTime);
                 if (held.Seconds > WOK_SEQ_HOLD_TIMEOUT_SEC)
                 {
-                    CFE_EVS_SendEvent(WOK_SEQ_CMD_ERR_EID, CFE_EVS_EventType_ERROR,
+                    CFE_EVS_SendEvent(WOK_SEQ_HOLD_TIMEOUT_EID, CFE_EVS_EventType_ERROR,
                                       "WOK_SEQ: Hold timeout at WP %u (%us) — proceeding unattended",
                                       WOK_Seq_AppData.WaypointIdx,
                                       WOK_SEQ_HOLD_TIMEOUT_SEC);
@@ -879,7 +915,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                 /* Fresh site = fresh plate seating campaign */
                 WOK_Seq_AppData.PlateReseatsSite = 0;
                 WOK_Seq_AppData.AcceptDegraded   = 0;
-                CFE_EVS_SendEvent(WOK_SEQ_CYCLE_COMPLETE_EID, CFE_EVS_EventType_INFORMATION,
+                CFE_EVS_SendEvent(WOK_SEQ_SITE_GEOM_EID, CFE_EVS_EventType_INFORMATION,
                                   "WOK_SEQ: Site %u geometry — (%.2f, %.2f) hdg %.1f",
                                   WOK_Seq_AppData.WaypointIdx,
                                   (double)WOK_Seq_AppData.SiteX_m,
@@ -944,7 +980,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                                 for (uint8 b = 0; b < WOK_HAL_GEO_MAX_PODS; b++)
                                     if (WOK_Seq_AppData.GeoStatus.MarginalMask & (1u << b))
                                         marg++;
-                                CFE_EVS_SendEvent(WOK_SEQ_CYCLE_COMPLETE_EID,
+                                CFE_EVS_SendEvent(WOK_SEQ_ARRAY_PLACED_EID,
                                                   CFE_EVS_EventType_INFORMATION,
                                                   "WOK_SEQ: Array placed at WP %u — %u marginal pod(s)",
                                                   WOK_Seq_AppData.WaypointIdx, marg);
@@ -996,16 +1032,16 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
             WOK_Seq_AppData.ThumpTickCount++;
 
             if (WOK_Seq_AppData.SeisStatus.SeqId == WOK_Seq_AppData.PendingSeqId &&
-                WOK_Seq_AppData.SeisStatus.ThumperState == WOK_HAL_SRC_ARMED)
+                WOK_Seq_AppData.SeisStatus.SourceState == WOK_HAL_SRC_ARMED)
             {
                 WOK_Seq_SendThumpFire();
             }
             else if (WOK_Seq_AppData.SeisStatus.SeqId == WOK_Seq_AppData.PendingSeqId &&
-                     WOK_Seq_AppData.SeisStatus.ThumperState == WOK_HAL_SRC_FIRED)
+                     WOK_Seq_AppData.SeisStatus.SourceState == WOK_HAL_SRC_FIRED)
             {
-                CFE_EVS_SendEvent(WOK_SEQ_CYCLE_COMPLETE_EID, CFE_EVS_EventType_INFORMATION,
+                CFE_EVS_SendEvent(WOK_SEQ_SOURCE_FIRED_EID, CFE_EVS_EventType_INFORMATION,
                                   "WOK_SEQ: Source fired — %.1fN at WP %u",
-                                  (double)WOK_Seq_AppData.SeisStatus.ThumperForce_N,
+                                  (double)WOK_Seq_AppData.SeisStatus.SourceForce_N,
                                   WOK_Seq_AppData.WaypointIdx);
                 WOK_Seq_SendThumpReset();
                 WOK_Seq_ChangeState(WOK_STATE_RECORD);
@@ -1023,7 +1059,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                                       WOK_Seq_AppData.ThumpEntryTime);
                 if (elapsed.Seconds > WOK_SEQ_SOURCE_TIMEOUT_SEC)
                 {
-                    CFE_EVS_SendEvent(WOK_SEQ_CMD_ERR_EID, CFE_EVS_EventType_ERROR,
+                    CFE_EVS_SendEvent(WOK_SEQ_SOURCE_TIMEOUT_EID, CFE_EVS_EventType_ERROR,
                                       "WOK_SEQ: Source timeout (%lus, %u ticks) — recording without source",
                                       (unsigned long)elapsed.Seconds,
                                       WOK_Seq_AppData.ThumpTickCount);
@@ -1063,7 +1099,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                     {
                         WOK_Seq_AppData.AcceptDegraded = 1;
                         WOK_Seq_AppData.SiteDegraded[WOK_Seq_AppData.WaypointIdx] = 1;
-                        CFE_EVS_SendEvent(WOK_SEQ_CMD_ERR_EID, CFE_EVS_EventType_ERROR,
+                        CFE_EVS_SendEvent(WOK_SEQ_PLATE_PODSIDE_EID, CFE_EVS_EventType_ERROR,
                                           "WOK_SEQ: Plate ratio low at WP %u but near pod scored %.2f — pod-side, accepting degraded without plate reseats",
                                           WOK_Seq_AppData.WaypointIdx,
                                           (double)WOK_Seq_AppData.SeisStatus.PodScore[0]);
@@ -1074,7 +1110,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                     {
                         WOK_Seq_AppData.PlateReseatsSite++;
                         WOK_Seq_SendSeisPlateReseat();
-                        CFE_EVS_SendEvent(WOK_SEQ_CYCLE_COMPLETE_EID,
+                        CFE_EVS_SendEvent(WOK_SEQ_PLATE_RESEAT_EID,
                                           CFE_EVS_EventType_INFORMATION,
                                           "WOK_SEQ: Plate coupling low at WP %u (ratio %.1f) — reseat %u/%u, re-shot",
                                           WOK_Seq_AppData.WaypointIdx,
@@ -1086,7 +1122,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                     {
                         WOK_Seq_AppData.AcceptDegraded = 1;
                         WOK_Seq_AppData.SiteDegraded[WOK_Seq_AppData.WaypointIdx] = 1;
-                        CFE_EVS_SendEvent(WOK_SEQ_CMD_ERR_EID, CFE_EVS_EventType_ERROR,
+                        CFE_EVS_SendEvent(WOK_SEQ_PLATE_EXHAUSTED_EID, CFE_EVS_EventType_ERROR,
                                           "WOK_SEQ: Plate reseat budget exhausted at WP %u — proceeding DEGRADED",
                                           WOK_Seq_AppData.WaypointIdx);
                     }
@@ -1096,7 +1132,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                 }
 
                 WOK_Seq_AppData.StrikesDone++;
-                CFE_EVS_SendEvent(WOK_SEQ_CYCLE_COMPLETE_EID, CFE_EVS_EventType_INFORMATION,
+                CFE_EVS_SendEvent(WOK_SEQ_RECORD_EID, CFE_EVS_EventType_INFORMATION,
                                   "WOK_SEQ: Record %u/%u at WP %u (%uk samples, strike@%lu%s)",
                                   WOK_Seq_AppData.StrikesDone, WOK_SEIS_STACK_TARGET,
                                   WOK_Seq_AppData.WaypointIdx,
@@ -1158,7 +1194,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                 {
                     if (WOK_Seq_AppData.HkHealth.BatteryV > WOK_DRILL_MIN_BATTERY_V)
                     {
-                        CFE_EVS_SendEvent(WOK_SEQ_STATE_CHANGE_EID, CFE_EVS_EventType_INFORMATION,
+                        CFE_EVS_SendEvent(WOK_SEQ_ICE_DRILL_EID, CFE_EVS_EventType_INFORMATION,
                                           "WOK_SEQ: Ice signature (%.0f%% conf) — DRILLING at WP %u",
                                           (double)(WOK_Seq_AppData.EvalConfidence * 100.0f),
                                           WOK_Seq_AppData.WaypointIdx);
@@ -1166,7 +1202,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                     }
                     else
                     {
-                        CFE_EVS_SendEvent(WOK_SEQ_CMD_ERR_EID, CFE_EVS_EventType_ERROR,
+                        CFE_EVS_SendEvent(WOK_SEQ_DRILL_BATT_SKIP_EID, CFE_EVS_EventType_ERROR,
                                           "WOK_SEQ: Ice flagged but battery %.1fV < %.1fV — skip drill",
                                           (double)WOK_Seq_AppData.HkHealth.BatteryV,
                                           (double)WOK_DRILL_MIN_BATTERY_V);
@@ -1177,7 +1213,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                 {
                     if (WOK_Seq_AppData.EvalFlag && !wp->DrillFlag)
                     {
-                        CFE_EVS_SendEvent(WOK_SEQ_CYCLE_COMPLETE_EID, CFE_EVS_EventType_INFORMATION,
+                        CFE_EVS_SendEvent(WOK_SEQ_ICE_NO_DRILL_EID, CFE_EVS_EventType_INFORMATION,
                                           "WOK_SEQ: Ice (%.0f%%) at WP %u — not drill-flagged",
                                           (double)(WOK_Seq_AppData.EvalConfidence * 100.0f),
                                           WOK_Seq_AppData.WaypointIdx);
@@ -1197,7 +1233,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
             }
             if (WOK_Seq_AppData.DrillHk.FaultBitmask != 0)
             {
-                CFE_EVS_SendEvent(WOK_SEQ_SAFE_ENTRY_EID, CFE_EVS_EventType_ERROR,
+                CFE_EVS_SendEvent(WOK_SEQ_DRILL_FAULT_EID, CFE_EVS_EventType_ERROR,
                                   "WOK_SEQ: Drill fault 0x%04X — e-stop + SAFE",
                                   WOK_Seq_AppData.DrillHk.FaultBitmask);
                 WOK_Seq_SendDrillEstop();
@@ -1235,7 +1271,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                         WOK_Seq_AppData.DrillHk.AppState == WOK_DRILL_STATE_IDLE)
                     {
                         WOK_Seq_AppData.DrillsCompleted++;
-                        CFE_EVS_SendEvent(WOK_SEQ_CYCLE_COMPLETE_EID, CFE_EVS_EventType_INFORMATION,
+                        CFE_EVS_SendEvent(WOK_SEQ_DRILL_DONE_EID, CFE_EVS_EventType_INFORMATION,
                                           "WOK_SEQ: Drill cycle complete at WP %u (%u total)",
                                           WOK_Seq_AppData.ReturnPhase == 2
                                               ? WOK_Seq_AppData.ReturnTargetIdx
@@ -1245,7 +1281,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                         {
                             /* Targeted return-drill done — mission complete */
                             WOK_Seq_AppData.ReturnPhase = 0;
-                            CFE_EVS_SendEvent(WOK_SEQ_CYCLE_COMPLETE_EID,
+                            CFE_EVS_SendEvent(WOK_SEQ_MISSION_COMPLETE_EID,
                                               CFE_EVS_EventType_INFORMATION,
                                               "WOK_SEQ: Tie-point gate satisfied — mission complete");
                             WOK_Seq_ChangeState(WOK_STATE_DONE);
@@ -1280,12 +1316,12 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
             {
                 case WOK_VERIFY_SUB_SHOT:
                     if (WOK_Seq_AppData.SeisStatus.SeqId == WOK_Seq_AppData.PendingSeqId &&
-                        WOK_Seq_AppData.SeisStatus.ThumperState == WOK_HAL_SRC_ARMED)
+                        WOK_Seq_AppData.SeisStatus.SourceState == WOK_HAL_SRC_ARMED)
                     {
                         WOK_Seq_SendThumpFire();
                     }
                     else if (WOK_Seq_AppData.SeisStatus.SeqId == WOK_Seq_AppData.PendingSeqId &&
-                             WOK_Seq_AppData.SeisStatus.ThumperState == WOK_HAL_SRC_FIRED)
+                             WOK_Seq_AppData.SeisStatus.SourceState == WOK_HAL_SRC_FIRED)
                     {
                         WOK_Seq_SendThumpReset();
                         WOK_Seq_AppData.VerifySub = WOK_VERIFY_SUB_WAIT;
@@ -1297,7 +1333,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                                               WOK_Seq_AppData.ThumpEntryTime);
                         if (el.Seconds > WOK_SEQ_SOURCE_TIMEOUT_SEC)
                         {
-                            CFE_EVS_SendEvent(WOK_SEQ_CMD_ERR_EID, CFE_EVS_EventType_ERROR,
+                            CFE_EVS_SendEvent(WOK_SEQ_TEST_SHOT_TIMEOUT_EID, CFE_EVS_EventType_ERROR,
                                               "WOK_SEQ: Test shot timeout — skipping verification at WP %u",
                                               WOK_Seq_AppData.WaypointIdx);
                             WOK_Seq_SendThumpReset();
@@ -1333,7 +1369,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                             WOK_Seq_AppData.VerifyPod         = p;
                             WOK_Seq_AppData.VerifyTriedMask  |= (uint8)(1u << p);
                             WOK_Seq_AppData.VerifyReseatsUsed++;
-                            CFE_EVS_SendEvent(WOK_SEQ_CYCLE_COMPLETE_EID,
+                            CFE_EVS_SendEvent(WOK_SEQ_POD_RESEAT_EID,
                                               CFE_EVS_EventType_INFORMATION,
                                               "WOK_SEQ: Pod %u score %.2f below %.2f — targeted reseat (%u/%u)",
                                               p, (double)worst,
@@ -1353,13 +1389,13 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                             if (verified < WOK_HAL_GEO_MAX_PODS)
                                 WOK_Seq_AppData.SiteDegraded[WOK_Seq_AppData.WaypointIdx] = 1;
                             if (verified < WOK_SEQ_MIN_VERIFIED_PODS)
-                                CFE_EVS_SendEvent(WOK_SEQ_SAFE_ENTRY_EID,
+                                CFE_EVS_SendEvent(WOK_SEQ_PARTIAL_ARRAY_EID,
                                                   CFE_EVS_EventType_CRITICAL,
                                                   "WOK_SEQ: Only %u/%u pods verified at WP %u — below partial-array minimum, proceeding FLAGGED",
                                                   verified, WOK_HAL_GEO_MAX_PODS,
                                                   WOK_Seq_AppData.WaypointIdx);
                             else
-                                CFE_EVS_SendEvent(WOK_SEQ_CYCLE_COMPLETE_EID,
+                                CFE_EVS_SendEvent(WOK_SEQ_ARRAY_VERIFIED_EID,
                                                   CFE_EVS_EventType_INFORMATION,
                                                   "WOK_SEQ: Array verified %u/%u at WP %u%s",
                                                   verified, WOK_HAL_GEO_MAX_PODS,
@@ -1468,7 +1504,7 @@ void WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr)
                     case WOK_PLACE_SUB_RETURN:
                         if (WOK_Seq_NavArrived())
                         {
-                            CFE_EVS_SendEvent(WOK_SEQ_CYCLE_COMPLETE_EID,
+                            CFE_EVS_SendEvent(WOK_SEQ_ARRAY_RECAPTURED_EID,
                                               CFE_EVS_EventType_INFORMATION,
                                               "WOK_SEQ: Array recaptured at WP %u",
                                               WOK_Seq_AppData.WaypointIdx);
@@ -1534,7 +1570,7 @@ void WOK_Seq_CheckMissionEnd(void)
 
     if (WOK_Seq_AppData.HkHealth.BatteryV <= WOK_DRILL_MIN_BATTERY_V)
     {
-        CFE_EVS_SendEvent(WOK_SEQ_SAFE_ENTRY_EID, CFE_EVS_EventType_CRITICAL,
+        CFE_EVS_SendEvent(WOK_SEQ_TIEPOINT_UNMET_EID, CFE_EVS_EventType_CRITICAL,
                           "WOK_SEQ: Tie-point gate UNMET — battery %.1fV too low to drill",
                           (double)WOK_Seq_AppData.HkHealth.BatteryV);
         WOK_Seq_ChangeState(WOK_STATE_DONE);
@@ -1546,7 +1582,7 @@ void WOK_Seq_CheckMissionEnd(void)
     float dl = WOK_Seq_AppData.SiteRecY[best] - WOK_Seq_AppData.NavStatus.PoseY_m;
     WOK_Seq_AppData.ReturnTargetIdx = (uint8)best;
     WOK_Seq_AppData.ReturnPhase     = 1;
-    CFE_EVS_SendEvent(WOK_SEQ_STATE_CHANGE_EID, CFE_EVS_EventType_INFORMATION,
+    CFE_EVS_SendEvent(WOK_SEQ_RETURN_TARGET_EID, CFE_EVS_EventType_INFORMATION,
                       "WOK_SEQ: Targeting WP %d (score %.2f) — returning (%.1f, %.1f) to drill",
                       best, (double)best_score, (double)df, (double)dl);
     WOK_Seq_SendNavGoTo(df, dl);
@@ -1577,6 +1613,35 @@ void WOK_Seq_CheckSafetyInhibits(void)
     WOK_Seq_AppData.FaultMask |= WOK_Seq_AppData.NavStatus.FaultMask;
     WOK_Seq_AppData.FaultMask |= WOK_Seq_AppData.GeoStatus.FaultMask;
     WOK_Seq_AppData.FaultMask |= WOK_Seq_AppData.SeisStatus.FaultMask;
+}
+
+/* ================================================================== */
+/*  Length check for a child app's telemetry before it is cached.     */
+/*  Child TLM arrives every SEND_HK tick, so a mismatch is evented    */
+/*  once (per *Reported flag) and counted thereafter.                 */
+/* ================================================================== */
+bool WOK_Seq_VerifyTlmLength(const CFE_SB_Buffer_t *BufPtr, size_t ExpectedLength,
+                             uint8 *Reported)
+{
+    size_t ActualLength = 0;
+    CFE_MSG_GetSize(&BufPtr->Msg, &ActualLength);
+    if (ActualLength != ExpectedLength)
+    {
+        WOK_Seq_AppData.ErrCounter++;
+        if (!*Reported)
+        {
+            CFE_SB_MsgId_t MsgId = CFE_SB_INVALID_MSG_ID;
+            CFE_MSG_GetMsgId(&BufPtr->Msg, &MsgId);
+            *Reported = 1;
+            CFE_EVS_SendEvent(WOK_SEQ_TLM_LEN_ERR_EID, CFE_EVS_EventType_ERROR,
+                              "WOK_SEQ: TLM len err MID 0x%04X: exp %lu got %lu (further errors counted only)",
+                              (unsigned int)CFE_SB_MsgIdToValue(MsgId),
+                              (unsigned long)ExpectedLength,
+                              (unsigned long)ActualLength);
+        }
+        return false;
+    }
+    return true;
 }
 
 /* ================================================================== */

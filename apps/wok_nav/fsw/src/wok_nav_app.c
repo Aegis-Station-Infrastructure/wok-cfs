@@ -8,7 +8,8 @@
  * Each GoTo command is a body-frame (DeltaForwardM, DeltaLateralM) step in
  * the persistent start frame captured at app init. NAV decomposes it into
  * a polar (turn, drive, turn-back) sequence using HAL primitives, and runs
- * the resulting sub-state machine on the 1 Hz HK tick.
+ * the resulting sub-state machine on each SEND_HK tick (~25 Hz with the
+ * stock SCH_LAB table; platform-dependent — all timeouts are wall-clock).
  *
  * Pose telemetry (PoseX_m, PoseY_m, HeadingDriftDeg) is dead-reckoned in
  * the start frame from completed sub-states. It's informational only —
@@ -49,7 +50,7 @@ static void     WOK_Nav_BeginSubTurnBack(void);
 static void     WOK_Nav_FinishStep(void);
 static void     WOK_Nav_FinishRealign(void);
 static void     WOK_Nav_EnterFault(uint16 bit, const char *reason);
-static uint32_t WOK_Nav_GetTimeMs(void);
+static uint32 WOK_Nav_GetTimeMs(void);
 
 /* ================================================================== */
 void WOK_Nav_AppMain(void)
@@ -58,10 +59,15 @@ void WOK_Nav_AppMain(void)
     CFE_SB_Buffer_t *BufPtr = NULL;
 
     CFE_ES_PerfLogEntry(WOK_NAV_PERF_ID);
+    WOK_Nav_AppData.RunStatus = CFE_ES_RunStatus_APP_RUN;
     Status = WOK_Nav_AppInit();
-    if (Status != CFE_SUCCESS) return;
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_ES_WriteToSysLog("WOK_NAV: Init failed (0x%08lX)\n", (unsigned long)Status);
+        WOK_Nav_AppData.RunStatus = CFE_ES_RunStatus_APP_ERROR;
+    }
 
-    while (true)
+    while (CFE_ES_RunLoop(&WOK_Nav_AppData.RunStatus) == true)
     {
         CFE_ES_PerfLogExit(WOK_NAV_PERF_ID);
         Status = CFE_SB_ReceiveBuffer(&BufPtr, WOK_Nav_AppData.CmdPipe,
@@ -70,9 +76,15 @@ void WOK_Nav_AppMain(void)
         if (Status == CFE_SUCCESS)
             WOK_Nav_ProcessCommandPacket(BufPtr);
         else
-            break;
+        {
+            CFE_EVS_SendEvent(WOK_NAV_PIPE_ERR_EID, CFE_EVS_EventType_ERROR,
+                              "WOK_NAV: SB pipe error (0x%08lX), app will exit",
+                              (unsigned long)Status);
+            WOK_Nav_AppData.RunStatus = CFE_ES_RunStatus_APP_ERROR;
+        }
     }
-    CFE_ES_ExitApp(CFE_ES_RunStatus_APP_ERROR);
+    CFE_ES_PerfLogExit(WOK_NAV_PERF_ID);
+    CFE_ES_ExitApp(WOK_Nav_AppData.RunStatus);
 }
 
 /* ================================================================== */
@@ -86,8 +98,20 @@ int32 WOK_Nav_AppInit(void)
                                 WOK_NAV_PIPE_DEPTH, WOK_NAV_PIPE_NAME);
     if (Status != CFE_SUCCESS) return Status;
 
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_NAV_CMD_MID),     WOK_Nav_AppData.CmdPipe);
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_NAV_SEND_HK_MID), WOK_Nav_AppData.CmdPipe);
+    Status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_NAV_CMD_MID), WOK_Nav_AppData.CmdPipe);
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(WOK_NAV_SUB_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "WOK_NAV: Subscribe to CMD failed (0x%08lX)", (unsigned long)Status);
+        return Status;
+    }
+    Status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_NAV_SEND_HK_MID), WOK_Nav_AppData.CmdPipe);
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(WOK_NAV_SUB_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "WOK_NAV: Subscribe to SEND_HK failed (0x%08lX)", (unsigned long)Status);
+        return Status;
+    }
 
     CFE_MSG_Init(CFE_MSG_PTR(WOK_Nav_AppData.HkTlm.TlmHeader),
                  CFE_SB_ValueToMsgId(WOK_NAV_TLM_MID), sizeof(WOK_Nav_HkTlm_t));
@@ -112,7 +136,7 @@ int32 WOK_Nav_AppInit(void)
     WOK_HAL_Mobility_Init();
 
     CFE_EVS_SendEvent(WOK_NAV_INIT_INF_EID, CFE_EVS_EventType_INFORMATION,
-                      "WOK_NAV: App initialised (relative-step model)");
+                      "WOK_NAV: App initialised (v" WOK_VERSION_STRING ") — relative-step model");
     return CFE_SUCCESS;
 }
 
@@ -166,7 +190,7 @@ void WOK_Nav_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                 WOK_Nav_AppData.LastSeqId = ((WOK_Nav_NoArgsCmd_t *)BufPtr)->SeqId;
                 WOK_Nav_AppData.CmdCounter++;
                 CFE_EVS_SendEvent(WOK_NAV_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
-                                  "WOK_NAV: NOOP");
+                                  "WOK_NAV: NOOP (v" WOK_VERSION_STRING ")");
             }
             break;
 
@@ -479,7 +503,8 @@ static void WOK_Nav_RunSubStateMachine(void)
 static void WOK_Nav_RunFaultDetection(float active_progress)
 {
     /* Tilt — also caught at HK app level, but trip locally so the rover
-     * stops mid-step rather than drifting until the next 1Hz HK cycle. */
+     * stops mid-step rather than drifting until the HK app's next
+     * SEND_HK tick and the sequencer's reaction to it. */
     if (WOK_Nav_AppData.TiltDeg > WOK_Nav_AppData.TiltFaultThreshold_deg)
     {
         WOK_Nav_EnterFault(WOK_FAULT_TILT_EXCEED, "tilt exceeded");
@@ -494,7 +519,7 @@ static void WOK_Nav_RunFaultDetection(float active_progress)
     }
 
     /* Stuck — no progress in StuckTimeoutMs, and HAL is supposedly moving */
-    uint32_t now = WOK_Nav_GetTimeMs();
+    uint32 now = WOK_Nav_GetTimeMs();
     if (active_progress > WOK_Nav_AppData.LastProgress + 0.001f)
     {
         WOK_Nav_AppData.LastProgress    = active_progress;
@@ -574,9 +599,9 @@ bool WOK_Nav_VerifyCmdLength(CFE_MSG_Message_t *MsgPtr, size_t ExpectedLength)
 
 /* uint64 multiply prevents overflow before final uint32 truncation;
  * delta arithmetic is mod-2^32 correct. */
-static uint32_t WOK_Nav_GetTimeMs(void)
+static uint32 WOK_Nav_GetTimeMs(void)
 {
     CFE_TIME_SysTime_t t = CFE_TIME_GetTime();
-    return (uint32_t)((uint64_t)t.Seconds * 1000ull + t.Subseconds / 4294967u);
+    return (uint32)((uint64)t.Seconds * 1000ull + t.Subseconds / 4294967u);
 }
 

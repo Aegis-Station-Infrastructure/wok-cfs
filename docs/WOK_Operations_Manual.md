@@ -1,8 +1,8 @@
 # WOK Operations Manual
 
-**Document:** WOK-OM-001
-**Version:** 1.0 (matches FSW through the CP + recalibration epochs)
-**Date:** July 2026
+**Document:** WOK-OM-001  
+**Version:** 1.1 (FSW 5.0)  
+**Date:** October 2026  
 **Audience:** mission operators — the person planning waypoint tables,
 watching a run, responding at holds, recovering from SAFE, and turning
 downlinked products into decisions.
@@ -95,7 +95,7 @@ seq.wpcount <n>
   found. `seq.mode 1` (survey-first): score every site, then return to
   the argmax and drill it. Either way the tie-point gate guarantees ≥1
   drill.
-- `seq.placement 1` enables per-pod placement (WOK-CP-001): DEPLOY
+- `seq.placement 1` enables per-pod placement: DEPLOY
   becomes the placement sub-sequence, VERIFY runs the coupling test
   shot, STOW retrieves pod-by-pod. Default 0 keeps the legacy fixed
   array.
@@ -106,12 +106,12 @@ seq.wpcount <n>
 |------|------|
 | Drive | 0.5 m/s (+ ~3 s per 90° turn) |
 | Basic site (3 stacked shots) | ~30–45 s |
-| Drill site | + ~4–5 min (2.5 m drill + 60 s heat + 30 s cool) |
+| Drill site | + ~4–5 min (2.5 m drill + ~55 s heat ramp, 10 s hold, ~90 s cool) |
 | Placement mode, per site | + ~2–3 min (out-and-back legs, 8 pod ops at 3–4 s each, 1–2 test shots, reseat drives if pods fail) |
 | Recal hold | up to 120 s if unattended |
 | Battery | 25.2 V at boot; SAFE below 22.0 V; drill inhibited below 23.5 V; bank charge inhibited below 23.0 V (reads as a source arm timeout, not a fault) |
 
-A default 7-waypoint mission with two drills runs ≈ 15 min; add ~50%
+A default 7-waypoint mission with two drills runs ≈ 12 min; add ~50%
 for placement mode. Plan to be DONE with battery margin above 23.5 V
 if late waypoints carry drill flags.
 
@@ -219,7 +219,7 @@ The pod inventory is honest across an abort: check GEO status TLM
 (`pod_state` per pod — PLACED_OK/MARGINAL means it is physically on
 the ground). Before resuming or restarting a placement mission:
 
-1. `geo.hk` → note which pods read placed.
+1. `tlm geo` → note which pods read placed.
 2. Drive to each placed pod's position if needed (`nav.goto`), then
    `geo.retrieve <pod>`; confirm `recaptured and stowed` / CARRIED.
 3. Then `seq.resume` (or restart the mission).
@@ -250,7 +250,7 @@ re-fetch; transfers are stop-and-wait and resume cleanly.
 | `corr_NNNN.wok` | sweep shots | correlated equivalent-impulse trace |
 | `stack_NNNN.wok` | per site | aligned stack, picks, QC, plate/degraded flags |
 | `coup_NNNN.wok` | per site (placement) | pod scores, seat attempts, plate metric, sync residuals |
-| `drill_NNNN.wok` | per drill | stiffness log + evolved-gas curve |
+| `drill_NNNN.wok` | per drill | drilling-response log + evolved-gas curve |
 
 Procedure after (or during) a mission:
 
@@ -267,6 +267,12 @@ Procedure after (or during) a mission:
    (drilled) vs **inferred** (seismic-only, extrapolated through the
    transfer function). Degraded/sync-flagged sites carry wider bounds —
    that is the flags doing their job, not a defect.
+
+Queue columns: `est wt%` is the transfer-function estimate with its
+3σ range; `P(ice)` the onboard posterior that the refractor is
+ice-cemented; `EDI` the extraction-difficulty index (binding ease from
+the nearest drill's evolved-gas fit × a depth factor; higher is easier);
+`score = wt% × P(ice) × EDI`.
 
 ## 9. Operator quick reference
 

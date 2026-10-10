@@ -20,8 +20,10 @@ and produces the per-site prospecting quantities:
     - regolith competence log (torque vs depth) and the drill-measured
       layer interface (first sustained torque step)
     - evolved-gas decomposition: the (cell temp, cumulative ppm) heating
-      curve is fit as a non-negative mix of three lab-calibrated release
-      modes (adsorbed ~110 C, pore ice ~160 C, hydrated mineral ~320 C).
+      curve is fit as a non-negative mix of three release modes (pore ice
+      ~100 C, adsorbed film ~160 C, hydrated mineral ~320 C). The modes
+      are the simulator's assumed values (wok_hal_sim_geology.c); replace
+      them with TGA/EGA lab calibration before use on real samples.
       This recovers the TOTAL volatile abundance (including what stayed
       bound above the 300 C cell limit) and the binding fractions that
       drive extraction cost.
@@ -40,7 +42,7 @@ Pure stdlib — no numpy/scipy required.
 import struct, glob, math, os, sys, csv
 
 # ── File formats (must match wok_seis_msg.h / wok_drill_msgids.h) ──────
-SEIS_HDR = "<IHHHHIIBBHffffffffIBBHffffBBBB"      # 84 bytes, v2 base
+SEIS_HDR = "<IHHHHIIBBHffffffffIBBBBffffBBBB"     # 84 bytes, v2 base
 SEIS_HDR_SIZE = struct.calcsize(SEIS_HDR)
 # v3 appends the EM-source shot context (dual-mode source, 112 bytes
 # total): mode, energy, sweep pilot params, bank state. The inversion
@@ -57,9 +59,10 @@ H1_MIN, H1_MAX, H1_STEP = 0.5, 3.0, 0.05
 PICK_SIGMA_MS = 0.35
 V2_ICE_MPS = 1200.0
 
-# ── Evolved-gas release modes (lab-calibrated, deg C) ──────────────────
-RELEASE_MODES = [("adsorbed", 110.0, 20.0),
-                 ("pore_ice", 160.0, 25.0),
+# ── Evolved-gas release modes (deg C) — sim-assumed, mirror the values in
+#    wok_hal_sim_geology.c; replace with lab TGA/EGA calibration ─────────
+RELEASE_MODES = [("pore_ice", 100.0, 20.0),
+                 ("adsorbed", 160.0, 30.0),
                  ("hydrated", 320.0, 30.0)]
 
 
@@ -126,7 +129,8 @@ def invert_stack(path, coup=None):
     h = struct.unpack_from(SEIS_HDR, raw, 0)
     (magic, ver, nch, fs, gain, spc, strike, svalid, chmask, seqid,
      force, sx, sy, shdg, p0, p1, p2, p3, acqidx,
-     fold, coh, _sp, fb0, fb1, fb2, fb3, q0, q1, q2, q3) = h
+     fold, coh, plate_degr, plate_reseats, fb0, fb1, fb2, fb3,
+     q0, q1, q2, q3) = h
     if magic != SEIS_MAGIC:
         return None
     weights = pod_weights(coup)
@@ -167,9 +171,10 @@ def invert_stack(path, coup=None):
         v2 += V2_STEP
     sse_min, v2_best, h1_best = best
 
-    # Likelihood-weighted posterior over the grid: w = exp(-ΔSSE/2σ²).
-    # ice_frac is the posterior mass on ice-fast refractors; the [lo, hi]
-    # ranges span cells within the ~3σ likelihood contour.
+    # Likelihood over the grid: L = exp(-ΔSSE/2σ²). ice_frac is the
+    # posterior mass (likelihood × prior) on ice-fast refractors; the
+    # [lo, hi] ranges span cells within the ~3σ contour of the LIKELIHOOD
+    # alone, so the prior does not narrow or shift the quoted ranges.
     two_sig2 = 2 * PICK_SIGMA_MS ** 2
     range_cut = math.exp(-4.5)          # 3-sigma likelihood ratio
     v2_lo = v2_hi = v2_best
@@ -180,15 +185,15 @@ def invert_stack(path, coup=None):
         if v2 > v1:
             h1 = H1_MIN
             while h1 <= H1_MAX:
+                lik = math.exp(-(sse_at(v2, h1) - sse_min) / two_sig2)
                 # Uniform-in-slowness prior: high-v2 cells are nearly
                 # indistinguishable (t_head → intercept), so uniform-in-v2
                 # would let sheer grid volume masquerade as ice evidence.
-                w = math.exp(-(sse_at(v2, h1) - sse_min) / two_sig2) \
-                    * (1000.0 / v2) ** 2
+                w = lik * (1000.0 / v2) ** 2
                 w_total += w
                 if v2 > V2_ICE_MPS:
                     w_ice += w
-                if w >= range_cut:
+                if lik >= range_cut:
                     v2_lo, v2_hi = min(v2_lo, v2), max(v2_hi, v2)
                     h1_lo, h1_hi = min(h1_lo, h1), max(h1_hi, h1)
                 h1 += H1_STEP
@@ -196,6 +201,7 @@ def invert_stack(path, coup=None):
 
     return {"file": os.path.basename(path), "site": (sx, sy), "fold": fold,
             "source": "sweep" if src_mode == 1 else "impulse",
+            "plate_degraded": bool(plate_degr), "plate_reseats": plate_reseats,
             "weights": weights,
             "coherence": coh, "picks_ms": picks, "v1": v1,
             "v2": v2_best, "v2_lo": v2_lo, "v2_hi": v2_hi,
@@ -295,7 +301,7 @@ def analyze_drill(path):
 
 # ── Fusion: transfer function, EDI, prospect ranking ────────────────────
 def fuse(stacks, drills, pairs):
-    """The commercial layer: calibrate Vp→ice from the drill tie points,
+    """The fusion layer: calibrate Vp→ice from the drill tie points,
     extrapolate across every surveyed site, score and rank prospects.
 
     The transfer function is fit to MEASURED v2 (not truth), so systematic
@@ -365,7 +371,9 @@ def fuse(stacks, drills, pairs):
         })
 
     fused.sort(key=lambda f: -f["score"])
-    print("\n  Prospect queue (score = wt% × P(ice) × extraction ease):")
+    print("\n  Prospect queue (score = wt% × P(ice) × EDI)")
+    print("  EDI = extraction-difficulty index: binding ease × depth factor,"
+          " 0-1, higher = easier to extract")
     for i, f in enumerate(fused, 1):
         print(f"   {i}. site ({f['site'][0]:5.1f},{f['site'][1]:5.1f})  "
               f"est {f['wt']:.2f} wt% [{f['wt_lo']:.2f}-{f['wt_hi']:.2f}]  "
@@ -421,6 +429,8 @@ def main():
         wtag = ""
         if any(w < 1.0 for w in s.get("weights", [])):
             wtag = "  wts=" + "/".join(f"{w:.2f}" for w in s["weights"])
+        if s.get("plate_degraded"):
+            wtag += f"  PLATE-DEGRADED ({s['plate_reseats']} reseats)"
         print(f"  {s['file']} site ({s['site'][0]:5.1f},{s['site'][1]:5.1f}) "
               f"[{s.get('source', 'impulse'):7s}]: "
               f"v1={s['v1']:4.0f}  v2={s['v2']:4.0f} [{s['v2_lo']:.0f}-{s['v2_hi']:.0f}] m/s  "

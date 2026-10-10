@@ -12,7 +12,7 @@
 - git
 - cmake >= 3.14
 - gcc, g++, make (apt install build-essential)
-- python3 (for ground console)
+- python3 3.10+ and the `websockets` package for the ground tools (`pip install -r ground/requirements.txt`)
 - ~500MB disk space
 
 Verify:
@@ -85,8 +85,11 @@ The script copies all six WOK apps + wok_common into the cFS tree,
 updates targets.cmake and the startup script, installs the TO_LAB
 subscription table, adds the WOK SEND_HK entries to the SCH_LAB table,
 and patches ci_lab/to_lab for multi-instance port offsets. **It covers
-steps 6–9 below — if it ran clean, skip to step 10.** Steps 6–9 remain
-as the manual/reference path.
+steps 6–9 below plus the ci_lab/to_lab port-offset patch (which has no
+manual step) — if it ran clean, skip to step 10.** Steps 6–9 remain
+as the manual/reference path. The script warns if the tree is not at the
+`v7.0.0` tag, is safe to re-run (it keeps the stock `to_lab_sub.c.bak`),
+and exits non-zero if either patch cannot be applied.
 
 If you prefer to copy the apps by hand instead of running install.sh:
 
@@ -105,7 +108,7 @@ If you prefer to copy the apps by hand instead of running install.sh:
       to_lab/           (stock Draco)
       sch_lab/          (stock Draco)
       sample_app/       (stock Draco)
-      wok_common/       (HAL + shared headers + ground tools)
+      wok_common/       (HAL + shared headers)
       wok_sequencer/    (WOK app — flat, same level as ci_lab)
       wok_nav/
       wok_geo/
@@ -121,17 +124,15 @@ Add WOK apps to the mission app list:
 
     cat >> ~/wok-cfs-build/sample_defs/targets.cmake << 'EOF'
 
-    # >>> WOK MISSION APPS
     list(APPEND MISSION_GLOBAL_APPLIST
         wok_common
         wok_sequencer
         wok_nav
         wok_geo
         wok_seis
-        wok_hk_health
         wok_drill
+        wok_hk_health
     )
-    # <<< WOK MISSION APPS
     EOF
 
 ## 7. Update Startup Script *(skip if install.sh ran clean)*
@@ -211,7 +212,7 @@ Expected output:
 
 After `make install`, check that WOK entries are in the installed script and before the `!`:
 
-    head -20 ~/wok-cfs-build/build/exe/cpu1/cf/cfe_es_startup.scr
+    head -15 ~/wok-cfs-build/build/exe/cpu1/cf/cfe_es_startup.scr
 
 ## 12. Run
 
@@ -220,12 +221,12 @@ After `make install`, check that WOK entries are in the installed script and bef
 
 Look for init events from all 6 WOK apps:
 
-    WOK_SEQ: App initialised (v2.3.0-seqid) — 7 waypoints loaded
+    WOK_SEQ: App initialised (v5.0.0) — 7 waypoints loaded
     WOK_SEIS: App initialised (v5.0.0) — dual-mode EM source
-    WOK_NAV: App initialised (relative-step model)
-    WOK_GEO: App initialised (v2.0.0)
-    WOK_DRILL: App initialised (v1.1.0) — stiffness log + evolved-gas
-    WOK_HK: App initialised (v2.0.0)
+    WOK_NAV: App initialised (v5.0.0) — relative-step model
+    WOK_GEO: App initialised (v5.0.0)
+    WOK_DRILL: App initialised (v5.0.0) — drilling-response log + evolved-gas
+    WOK_HK: App initialised (v5.0.0)
 
 (The "Startup Sync failed" line that follows is normal — see
 Troubleshooting.)
@@ -256,6 +257,13 @@ You are now set up. To fly a mission, see the Quick Start in the
 README and the [Operations Manual](WOK_Operations_Manual.md). For a
 one-command sim stack (core + web dashboard), see `tools/wok_sim.sh`.
 
+`tools/wok_sim.sh up|down|status` wraps steps 12–14. It honours
+`WOK_CFS_EXE` (path to `build/exe/cpu1`, default `~/wok-cfs-build/...`),
+`WOK_WS_PORT` (bridge WebSocket port, default 8765), `WOK_HTTP_PORT`
+(dashboard HTTP port, default 8090) and `WOK_WS_HOST` (default
+127.0.0.1; set 0.0.0.0 only on a trusted LAN — the bridge has no
+authentication).
+
 ## 15. Clear Stale Shared Memory
 
 If HAL init fails on startup (common after abnormal shutdown):
@@ -271,8 +279,10 @@ shared-memory applications you care about are running.
 **Rover never leaves IDLE after `seq.start`** — The SCH_LAB table
 (step 9) is missing the WOK SEND_HK entries. The sequencer's state
 machine runs only on the HK tick; with no SEND_HK requests it never
-advances. install.sh does *not* patch SCH_LAB — step 9 is always
-manual. Rebuild and reinstall after editing the table.
+advances. install.sh adds them and stops with an ERROR (exit 1) if the
+SCH_LAB terminator or the ci_lab/to_lab port-offset patch cannot be
+applied; in that case apply step 9 (or `cfs_integration/port-offset.patch`)
+by hand and re-run. Rebuild and reinstall after editing the table.
 
 **Stale data products** — The sim writes archives to `/tmp/wok_data`,
 and file numbering restarts with each boot, so products from a

@@ -28,7 +28,7 @@ typedef enum
     WOK_STATE_IDLE      = 0,
     WOK_STATE_MOVE      = 1,
     WOK_STATE_DEPLOY    = 2,   /* Deploy geophone array              */
-    WOK_STATE_THUMP     = 3,   /* Arm + fire thumper                 */
+    WOK_STATE_THUMP     = 3,   /* Arm + fire the seismic source      */
     WOK_STATE_RECORD    = 4,   /* Seismic acquisition running        */
     WOK_STATE_EVALUATE  = 5,   /* Check data against threshold       */
     WOK_STATE_DRILL     = 6,   /* Drill arm deploy→drill→sample→stow */
@@ -100,8 +100,7 @@ typedef struct
     uint8   SourceMode;      /* seismic source mode at this site:
                                 0 = impulse (default), 1 = sweep      */
     uint8   RecalFlag;       /* 1 = hold after MOVE for ground
-                                recalibration (was spare — size and
-                                offsets unchanged)                    */
+                                recalibration                         */
     uint8   Spare;
     float   SourceEnergyJ;   /* impulse bank energy; 0 = app default  */
 } WOK_Waypoint_t;

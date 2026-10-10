@@ -15,9 +15,9 @@
 #include "wok_platform_cfg.h"
 #include "wok_geo_msg.h"
 #include "wok_geo_events.h"
+#include "wok_hal_geo.h"
 
 #define WOK_GEO_PIPE_NAME   "WOK_GEO_PIPE"
-#define WOK_GEO_PIPE_DEPTH  16
 
 /* GEO-specific fault bits */
 #define WOK_GEO_FAULT_JAM         0x0100
@@ -27,6 +27,7 @@
 typedef struct
 {
     CFE_SB_PipeId_t       CmdPipe;
+    uint32                RunStatus;
     WOK_Geo_HkTlm_t      HkTlm;
     WOK_Geo_StatusTlm_t   StatusTlm;
 
@@ -45,8 +46,7 @@ typedef struct
     uint16  StowTimeoutMs;
 
     /* Per-pod placement (CP-3): the app owns the seat -> force-proxy ->
-     * reseat loop; the sequencer only sees terminal pod states. Needs
-     * wok_hal_geo.h for WOK_HAL_GEO_MAX_PODS (included via app .c). */
+     * reseat loop; the sequencer only sees terminal pod states. */
     struct
     {
         uint8   State;           /* WOK_GEO_POD_* (app state)          */
@@ -57,7 +57,7 @@ typedef struct
         float   SeatForce_N;
         float   X_m, Y_m;
         uint32  CmdStartMs;      /* motion-timeout reference           */
-    } Pod[4];                    /* = WOK_HAL_GEO_MAX_PODS             */
+    } Pod[WOK_HAL_GEO_MAX_PODS];
     uint8   ActivePod;           /* pod in motion; 0xFF = none         */
 
     uint16  CmdCounter;

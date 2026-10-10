@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 # Copyright 2026 Aegis Station Infrastructure LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Mission-run toolkit for WOK verification (session tooling).
+"""Mission-run toolkit for WOK verification (verification tooling).
+
+Usage: wok_mission_tools.py [--host H] [--cmd-port P] [--tlm-port P] <subcommand> ...
+
+Targets 127.0.0.1:1234 (CI_LAB) / 2234 (TO_LAB) by default. To drive a
+second WOK instance either pass the ports explicitly or set
+AEGIS_PORT_OFFSET=<n> (the same offset the core was started with): the
+ports become 1234+n / 2234+n.
 
 Subcommands:
   enable_tlm                       — TO_LAB enable (bare-IP payload, once per boot)
@@ -15,8 +22,9 @@ Subcommands:
 """
 import socket, struct, sys, time, math, os, glob, re
 
-CMD_ADDR = ("127.0.0.1", 1234)
-TLM_PORT = 2234
+PORT_OFFSET = int(os.environ.get("AEGIS_PORT_OFFSET", "0") or 0)
+CMD_ADDR = ("127.0.0.1", 1234 + PORT_OFFSET)
+TLM_PORT = 2234 + PORT_OFFSET
 
 MID = {"SEQ": 0x18D0, "NAV": 0x18D2, "GEO": 0x18D4, "SEIS": 0x18D6,
        "HK": 0x18D8, "DRILL": 0x18DA, "TO_LAB": 0x1880}
@@ -171,6 +179,16 @@ def events(logpath):
 
 if __name__ == "__main__":
     a = sys.argv[1:]
+    # Leading --host/--cmd-port/--tlm-port options (override AEGIS_PORT_OFFSET)
+    while len(a) >= 2 and a[0] in ("--host", "--cmd-port", "--tlm-port"):
+        opt, val = a[0], a[1]
+        if opt == "--host":
+            CMD_ADDR = (val, CMD_ADDR[1])
+        elif opt == "--cmd-port":
+            CMD_ADDR = (CMD_ADDR[0], int(val))
+        else:
+            TLM_PORT = int(val)
+        a = a[2:]
     if not a:
         print(__doc__); sys.exit(2)
     c = a[0]

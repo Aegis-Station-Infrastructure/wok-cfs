@@ -5,21 +5,21 @@
 /************************************************************************
  * WOK_SEIS — Message Definitions (commands + telemetry)
  *
- * v5.0 — Dual-mode EM source (impulse + swept-sine): CONFIG_SOURCE
- *        command, source/bank/sweep status fields, file header v3,
- *        correlated-trace product (corr_NNNN.wok).
- * v2.1 — Added thumper commands (ARM, FIRE, RESET) and EVALUATE.
+ * PUBLIC header: command codes and structures, HK / status / quicklook /
+ * file-chunk telemetry, and the on-disk trace and coupling-record file
+ * headers that the ground tools decode byte-for-byte.
  ************************************************************************/
 #ifndef WOK_SEIS_MSG_H
 #define WOK_SEIS_MSG_H
 
 #include "cfe.h"
+#include "wok_platform_cfg.h"   /* WOK_SEIS_MAX_CHANNELS */
 
 /* ================================================================== */
 /*  Command codes for WOK_SEIS_CMD_MID                                */
 /*                                                                    */
 /*  CCs 4-6 kept their names and external behavior across the source  */
-/*  change (drop-weight thumper -> EM source) for SEQ compatibility:  */
+/*  change (drop-weight -> EM source) for SEQ compatibility:          */
 /*  ARM now charges the capacitor bank, FIRE discharges it (impulse)  */
 /*  or starts the pilot sweep, RESET safes the bank.                  */
 /* ================================================================== */
@@ -56,7 +56,7 @@ typedef struct
     uint16  SampleRate_Hz;       /* Fs — samples per second per chan  */
     uint8   Gain;                /* ADC gain setting (0-3 typical)    */
     uint8   ChannelMask;         /* Bit mask of active channels       */
-    uint16  Flags;               /* WOK_SEIS_ACQFLAG_* (was spare)    */
+    uint16  Flags;               /* WOK_SEIS_ACQFLAG_*                */
     /* Survey-site context (rover pose in the mission start frame) —
      * stamped into the trace file so every record carries its own
      * source-receiver geometry. SEQ fills from NAV pose; 0 from ground. */
@@ -75,9 +75,9 @@ typedef struct
  * plate-coupling verification (SEQ sets it after the per-site reseat
  * budget is exhausted — the site proceeds flagged degraded). */
 #define WOK_SEIS_ACQFLAG_ACCEPT_DEGRADED  0x0001
-/* This record is a low-energy coupling TEST SHOT (CP-4, WOK-CP-001
- * §4.1): compute per-pod coupling scores from it, archive the coupling
- * record, and keep it out of the site stack. */
+/* This record is a low-energy coupling TEST SHOT (CP-4, WOK-CP-001):
+ * compute per-pod coupling scores from it, archive the coupling record,
+ * and keep it out of the site stack. */
 #define WOK_SEIS_ACQFLAG_TEST_SHOT        0x0002
 
 /* CC 11: SET_POD_GEOMETRY — actual per-pod placement for the current
@@ -105,8 +105,9 @@ typedef struct
  * subsequent ARM/FIRE cycles. Persistent until reconfigured; applied to
  * the hardware at the next ARM. Zero-valued parameters keep the current
  * setting, so ground can e.g. switch mode without respecifying the
- * sweep band. Defaults (platform cfg) preserve v4.0 behavior exactly:
- * impulse mode at the 50 J drop-weight-equivalent energy. */
+ * sweep band. Defaults (platform cfg) preserve the drop-weight (pre-5.0)
+ * source's behavior exactly: impulse mode at the 50 J drop-weight-
+ * equivalent energy. */
 typedef struct
 {
     CFE_MSG_CommandHeader_t CmdHeader;
@@ -167,7 +168,7 @@ typedef struct
     uint16  CmdCounter;
     uint16  ErrCounter;
     uint8   Acquiring;           /* 1 = acquisition in progress       */
-    uint8   ThumperState;        /* WOK_HAL_SrcState_t: 0=IDLE,1=CHARGING,
+    uint8   SourceState;        /* WOK_HAL_SrcState_t: 0=IDLE,1=CHARGING,
                                     2=ARMED,3=FIRED,4=SWEEPING         */
     uint16  FaultMask;
 } WOK_Seis_HkTlm_t;
@@ -186,25 +187,25 @@ typedef struct
     uint16  Duration_sec;        /* configured duration                */
     uint16  SampleRate_Hz;       /* configured Fs                     */
     uint16  FaultMask;
-    /* Thumper + evaluate status */
-    uint8   ThumperState;        /* WOK_HAL_SRC_* state                */
+    /* Source + evaluate status */
+    uint8   SourceState;        /* WOK_HAL_SRC_* state                */
     uint8   EvalFlag;            /* 1 = ice signature detected        */
     uint16  SeqId;               /* Echo of last cmd SeqId            */
     float   EvalConfidence;      /* 0.0–1.0 confidence of detection   */
-    float   ThumperForce_N;      /* Last impulse magnitude            */
-    /* Strike-to-trace synchronization (appended v2.4 — decoders that
-     * only unpack the prefix above keep working) */
+    float   SourceForce_N;      /* Last impulse magnitude            */
+    /* Strike-to-trace synchronization (appended — decoders that only
+     * unpack the prefix above keep working) */
     uint32  StrikeSampleIdx;     /* t0 as per-channel sample index    */
     uint8   StrikeValid;         /* 1 = strike landed in acq window   */
     uint8   SpareS[3];
     uint32  TraceSamples;        /* samples/chan retained in buffer   */
-    /* Stack + first-break picks (appended v2.5) */
+    /* Stack + first-break picks (appended) */
     float   FirstBreakMs[4];     /* per pod, ms after strike t0; <0 = no pick */
     uint8   PickQuality[4];      /* 0-100 (STA/LTA trigger strength)  */
     uint8   StackFold;           /* strikes accumulated at this site  */
     uint8   CoherencePct;        /* 0-100 mean stack coherence        */
     uint16  SpareP;
-    /* Onboard refraction inversion (appended v3.0) — the evidence
+    /* Onboard refraction inversion (appended) — the evidence
      * behind EvalFlag/EvalConfidence when picks drive the verdict */
     float   EvalV1_mps;          /* direct-wave (layer 1) velocity    */
     float   EvalV2_mps;          /* best-fit refractor velocity       */
@@ -212,7 +213,7 @@ typedef struct
     float   EvalIceFrac;         /* share of near-optimal cells that
                                     are ice-fast (0-1); <0 = pick-based
                                     evaluate not run                   */
-    /* EM source status (appended v5.0) — decoders that only unpack the
+    /* EM source status (appended) — decoders that only unpack the
      * prefix above keep working */
     uint8   SourceMode;          /* WOK_HAL_SRC_MODE_* configured      */
     uint8   BankSOC_pct;         /* bank charge, % of shot target      */
@@ -245,6 +246,12 @@ typedef struct
     uint8   SyncSuspectMask;     /* |residual| > threshold             */
     uint8   SpareY[3];
 } WOK_Seis_StatusTlm_t;
+
+/* Ground decoders unpack these at fixed offsets — catch layout drift at
+ * compile time (TLM sizes include the 16-byte telemetry header). */
+CompileTimeAssert(sizeof(WOK_Seis_HkTlm_t)        == 24,   WOK_Seis_HkTlm_t_WrongSize);
+CompileTimeAssert(sizeof(WOK_Seis_StatusTlm_t)    == 152,  WOK_Seis_StatusTlm_t_WrongSize);
+CompileTimeAssert(sizeof(WOK_Seis_FileChunkTlm_t) == 1076, WOK_Seis_FileChunkTlm_t_WrongSize);
 
 /* ================================================================== */
 /*  Coupling record (coup_NNNN.wok) — CP-4, WOK-CP-001                */
@@ -285,12 +292,12 @@ typedef struct
     uint8   SpareS2[3];
 } WOK_Coup_FileHeader_t;         /* v1: 72 bytes; v2: 92 — little-endian */
 
+CompileTimeAssert(sizeof(WOK_Coup_FileHeader_t) == 92, WOK_Coup_FileHeader_t_WrongSize);
+
 /* ================================================================== */
 /*  Quicklook telemetry  (WOK_SEIS_QUICKLOOK_TLM_MID)               */
 /*  Down-sampled stats for ground monitoring during acquisition       */
 /* ================================================================== */
-#define WOK_SEIS_MAX_CHANNELS   4
-
 typedef struct
 {
     CFE_MSG_TelemetryHeader_t TlmHeader;
@@ -300,6 +307,8 @@ typedef struct
     uint16  SampleRate_Hz;
     uint16  Spare;
 } WOK_Seis_QuicklookTlm_t;
+
+CompileTimeAssert(sizeof(WOK_Seis_QuicklookTlm_t) == 68, WOK_Seis_QuicklookTlm_t_WrongSize);
 
 /* ================================================================== */
 /*  Trace file (raw per-shot archive, correlated product, AND stacked */
@@ -340,7 +349,7 @@ typedef struct
     uint8   StrikeValid;        /* 1 = strike landed in this window    */
     uint8   ChannelMask;        /* which physical pods are active      */
     uint16  SeqId;              /* sequencer correlation at StartAcq   */
-    float   ThumperForce_N;     /* strike impulse magnitude            */
+    float   SourceForce_N;     /* strike impulse magnitude            */
     float   SiteX_m;            /* rover pose, mission start frame     */
     float   SiteY_m;
     float   SiteHeadingDeg;
@@ -357,7 +366,7 @@ typedef struct
     uint8   PlateReseats;       /* reseat attempts at this site        */
     float   FirstBreakMs[WOK_SEIS_MAX_CHANNELS]; /* <0 = no pick        */
     uint8   PickQuality[WOK_SEIS_MAX_CHANNELS];  /* 0-100               */
-    /* v3: EM source shot context. ThumperForce_N above carries the
+    /* v3: EM source shot context. SourceForce_N above carries the
      * shot's peak plate force in both modes. */
     uint8   SourceMode;         /* WOK_HAL_SRC_MODE_* at fire          */
     uint8   SpareV3[3];
@@ -368,5 +377,7 @@ typedef struct
     float   BankV;              /* bank voltage at archive time        */
     float   BankSOC_pct;        /* bank charge % at archive time       */
 } WOK_Seis_FileHeader_t;
+
+CompileTimeAssert(sizeof(WOK_Seis_FileHeader_t) == 112, WOK_Seis_FileHeader_t_WrongSize);
 
 #endif /* WOK_SEIS_MSG_H */

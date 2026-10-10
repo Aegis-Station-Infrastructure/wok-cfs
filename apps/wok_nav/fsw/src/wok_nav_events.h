@@ -14,6 +14,7 @@
 #define WOK_NAV_CMD_ERR_EID          4
 #define WOK_NAV_PIPE_ERR_EID         5
 #define WOK_NAV_LEN_ERR_EID          6
+#define WOK_NAV_SUB_ERR_EID          7
 #define WOK_NAV_GOTO_EID             10
 #define WOK_NAV_ARRIVED_EID          11
 #define WOK_NAV_STOP_EID             12

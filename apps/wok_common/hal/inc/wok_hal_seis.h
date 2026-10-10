@@ -13,7 +13,7 @@
 **
 **   IMPULSE — single cap discharge -> one strike. Commanded energy sets
 **             the bank charge level (gravity-independent). Default mode;
-**             replaces the v2.x drop-weight thumper.
+**             replaces the drop-weight (pre-5.0) source.
 **   SWEEP   — the same actuator driven with a linear swept sine (pilot)
 **             for force-limited long-offset work. Recorded traces are
 **             cross-correlated onboard against the analytically
@@ -32,8 +32,9 @@
 #include <math.h>
 
 /* ── Source States ───────────────────────────────────────────────── */
-/* Values 0-3 keep the legacy thumper meanings (IDLE/ARMING/ARMED/FIRED)
- * so telemetry decoders remain valid; CHARGING is the bank-charge phase
+/* Values 0-3 keep the drop-weight (pre-5.0) source's meanings
+ * (IDLE/ARMING/ARMED/FIRED) so telemetry decoders remain valid;
+ * CHARGING is the bank-charge phase
  * of ARM. SWEEPING is new: sweep emission in progress after FIRE. */
 #define WOK_HAL_SRC_IDLE       0   /* Bank safe/dumped, ready to arm    */
 #define WOK_HAL_SRC_CHARGING   1   /* Bank charging toward target       */
@@ -94,15 +95,14 @@ int32_t WOK_HAL_Seis_GetQuicklook(float *rms, float *peak, float *dc, uint8_t nc
  *        edge latches the ADC sample counter); source drive and ADC
  *        must share one hardware clock.
  *
- *        CONTRACT EVOLUTION (WOK-CP-001, flagged 2026-07-12):
+ *        CONTRACT EVOLUTION (WOK-CP-001):
  *        the flight baseline is WIRELESS pods, which void the shared-
  *        clock assumption — t0 becomes a per-pod quantity with per-pod
  *        clock error (RF sync pulse or disciplined pod clocks). This
  *        call evolves to per-channel strike indices plus per-pod
  *        sync-quality/clock-error fields, and the picker consumes
- *        per-pod t0. Implement at flight porting (Capability Gap
- *        Analysis §11); the shared-clock form remains valid for the
- *        sim. The per-pod sync-error MODEL is sim-exercisable as of
+ *        per-pod t0. Implement at flight porting; the shared-clock
+ *        form remains valid for the sim. The per-pod sync-error MODEL is sim-exercisable as of
  *        CP-5 (WOK_SIM_SYNC_ERR_MS + the test shot's residual check),
  *        so the picker/inversion chain is already hardened against
  *        the budgeted clock error before the contract lands.
@@ -242,8 +242,8 @@ static inline float WOK_HAL_Src_PilotSample(float t_s, float f0_hz,
  * In the sim, the verdict derives from the synthetic subsurface model at
  * the configured site (elevated refractor Vp → ice-cemented), so results
  * are deterministic per site and agree with what the drill sim will find.
- * (Since v2.5 the SEIS app computes EVALUATE from its own onboard
- * first-break picks; this HAL call is the no-picks fallback only.)
+ * (The SEIS app computes EVALUATE from its own onboard first-break
+ * picks; this HAL call is the no-picks fallback only.)
  */
 int32_t WOK_HAL_Seis_Evaluate(uint8_t *flag, float *confidence);
 

@@ -12,6 +12,8 @@ Type 'help' for available commands, 'quit' to exit.
 
 Usage:
   python3 wok_console.py [--host 127.0.0.1] [--cmd-port 1234] [--tlm-port 2234]
+
+Requires Python 3.10+ (standard library only).
 """
 
 import socket
@@ -73,6 +75,11 @@ SEQ_START_CC          = 2
 SEQ_ABORT_CC          = 3
 SEQ_RESUME_CC         = 4
 SEQ_SET_WAYPOINT_CC   = 5
+SEQ_SET_MODE_CC       = 6
+SEQ_LOAD_WAYPOINT_CC  = 7
+SEQ_SET_WP_COUNT_CC   = 8
+SEQ_SET_PLACEMENT_CC  = 9
+SEQ_RELEASE_CC        = 10
 
 # wok_nav
 NAV_NOOP_CC           = 0
@@ -368,8 +375,8 @@ class TlmListener:
 # Telemetry Decoders
 # ============================================================
 def decode_seq_hk(data):
-    """Decode WOK_Seq_HkTlm_t (after 12-byte CCSDS header)."""
-    if not data or len(data) < 26:
+    """Decode WOK_Seq_HkTlm_t (after the 16-byte CCSDS TLM header)."""
+    if not data or len(data) < 16 + struct.calcsize("<HHBBHHH"):
         return None
     # Payload starts after the 16-byte TLM header (6 primary + 6 time
     # secondary + 4 alignment padding — Draco default config)
@@ -404,7 +411,7 @@ def decode_seq_mode(data):
             "total_waypoints": total_wp,
             "faults": decode_faults(fault_mask),
         }
-        # v4.0 targeting status
+        # Targeting status (appended fields)
         if len(data) >= off + 16:
             mode, drills, best_idx, _sp, best_score = \
                 struct.unpack_from("<BBBBf", data, off + 8)
@@ -424,7 +431,7 @@ def decode_nav_status(data):
     Pose is dead-reckoned in the start frame: pose_x = forward distance from
     mission start, pose_y = lateral (+ = left), heading_drift = deg from start
     heading. Informational only — arrival is gated on per-step deltas."""
-    if not data or len(data) < 40:
+    if not data or len(data) < 16 + struct.calcsize("<fffffBBHHH"):
         return None
     off = 16
     try:
@@ -503,20 +510,20 @@ def decode_seis_status(data):
             "sample_rate_Hz": fs,
             "faults": decode_faults(faults),
         }
-        # v2.1 thumper/eval fields
+        # Source + evaluate fields
         if len(data) >= off + 24:
-            thumper, eval_flag, seq_id, eval_conf, force = \
+            source, eval_flag, seq_id, eval_conf, force = \
                 struct.unpack_from("<BBHff", data, off + 12)
-            thumper_states = {0: "IDLE", 1: "CHARGING", 2: "ARMED", 3: "FIRED",
-                              4: "SWEEPING"}
+            source_states = {0: "IDLE", 1: "CHARGING", 2: "ARMED", 3: "FIRED",
+                             4: "SWEEPING"}
             d.update({
-                "thumper": thumper_states.get(thumper, f"?{thumper}"),
+                "source": source_states.get(source, f"?{source}"),
                 "eval_flag": bool(eval_flag),
                 "eval_confidence": round(eval_conf, 2),
-                "thumper_force_N": round(force, 1),
+                "source_force_n": round(force, 1),
                 "seq_id": seq_id,
             })
-        # v2.4 strike-to-trace sync fields
+        # Strike-to-trace sync fields (appended)
         if len(data) >= off + 36:
             strike_idx, strike_valid, trace_samps = \
                 struct.unpack_from("<IB3xI", data, off + 24)
@@ -525,7 +532,7 @@ def decode_seis_status(data):
                 "strike_valid": bool(strike_valid),
                 "trace_samples": trace_samps,
             })
-        # v2.5 stack + first-break picks
+        # Stack + first-break picks (appended)
         if len(data) >= off + 60:
             fb = struct.unpack_from("<ffff", data, off + 36)
             q0, q1, q2, q3, fold, coh = struct.unpack_from("<BBBBBB", data, off + 52)
@@ -535,7 +542,7 @@ def decode_seis_status(data):
                 "stack_fold": fold,
                 "coherence_pct": coh,
             })
-        # v3.0 onboard refraction inversion
+        # Onboard refraction inversion (appended)
         if len(data) >= off + 76:
             v1, v2, h1, icefrac = struct.unpack_from("<ffff", data, off + 60)
             d.update({
@@ -544,7 +551,7 @@ def decode_seis_status(data):
                 "eval_depth_m": round(h1, 2),
                 "eval_ice_frac": round(icefrac, 2),
             })
-        # v5.0 EM source: mode, bank, sweep + correlation progress
+        # EM source: mode, bank, sweep + correlation progress (appended)
         if len(data) >= off + 84:
             src_mode, bank_soc, sweep_pct, corr_pct, bank_v = \
                 struct.unpack_from("<BBBBf", data, off + 76)
@@ -592,7 +599,7 @@ def decode_seis_status(data):
 
 def decode_hk_health(data):
     """Decode WOK_Hk_HealthTlm_t."""
-    if not data or len(data) < 44:
+    if not data or len(data) < 16 + struct.calcsize("<HHffffffHBBBBBB"):
         return None
     off = 16
     try:
@@ -615,7 +622,7 @@ def decode_hk_health(data):
 
 def decode_drill_hk(data):
     """Decode WOK_Drill_HkTlm_t (0x08DA)."""
-    if not data or len(data) < 32:
+    if not data or len(data) < 16 + struct.calcsize("<HHBBHHHff"):
         return None
     off = 16
     try:
@@ -637,7 +644,7 @@ def decode_drill_hk(data):
 
 def decode_drill_status(data):
     """Decode WOK_Drill_StatusTlm_t (0x08DB)."""
-    if not data or len(data) < 48:
+    if not data or len(data) < 16 + struct.calcsize("<BBBB ff BBBB ffff BBBB fff"):
         return None
     off = 16
     try:
@@ -664,7 +671,7 @@ def decode_drill_status(data):
             "vapor_pressure_Pa": round(vapor_pa, 1),
             "volatile_conc_ppm": round(volatile_ppm, 1),
         }
-        # v1.1 stiffness-log channels
+        # Stiffness-log channels (appended)
         if len(data) >= off + 56:
             wob, rop = struct.unpack_from("<ff", data, off + 48)
             d.update({"wob_N": round(wob, 1), "rop_mps": round(rop, 4)})
@@ -780,20 +787,20 @@ def cmd_seq_mode(sender, args):
     """Set mission mode. Usage: seq.mode <0|1>  (0=drill-inline, 1=survey-first)"""
     mode = int(args[0]) if args else 1
     payload = struct.pack("<BBBB", mode, 0, 0, 0)
-    sender.send(WOK_SEQ_CMD_MID, 6, payload,
+    sender.send(WOK_SEQ_CMD_MID, SEQ_SET_MODE_CC, payload,
                 label=f"SEQ SET_MODE {'SURVEY_FIRST' if mode else 'DRILL_INLINE'}")
 
 def cmd_seq_placement(sender, args):
     """Set placement mode. Usage: seq.placement <0|1>  (0=fixed array, 1=per-pod placement)"""
     p = int(args[0]) if args else 1
     payload = struct.pack("<BBBB", p, 0, 0, 0)
-    sender.send(WOK_SEQ_CMD_MID, 9, payload,
+    sender.send(WOK_SEQ_CMD_MID, SEQ_SET_PLACEMENT_CC, payload,
                 label=f"SEQ SET_PLACEMENT {'PER_POD' if p else 'FIXED_ARRAY'}")
 
 def cmd_seq_release(sender, args):
     """Release a recalibration HOLD (recal-flagged waypoint) so the
     sequencer proceeds to the site work."""
-    sender.send(WOK_SEQ_CMD_MID, 10, label="SEQ RELEASE")
+    sender.send(WOK_SEQ_CMD_MID, SEQ_RELEASE_CC, label="SEQ RELEASE")
 
 def cmd_seq_loadwp(sender, args):
     """Upload one waypoint. Usage: seq.loadwp <idx> <fwd_m> <lat_m> [drill01] [srcmode01] [energy_J] [recal01]
@@ -810,7 +817,7 @@ def cmd_seq_loadwp(sender, args):
     recal  = int(args[6]) if len(args) > 6 else 0
     payload = struct.pack("<HBBfffBBBB", idx, drill, src, fwd, lat, energy,
                           recal, 0, 0, 0)
-    sender.send(WOK_SEQ_CMD_MID, 7, payload,
+    sender.send(WOK_SEQ_CMD_MID, SEQ_LOAD_WAYPOINT_CC, payload,
                 label=f"SEQ LOAD_WP {idx} ({fwd},{lat}) drill={drill} "
                       f"src={'SWEEP' if src else 'IMPULSE'} E={energy}J")
 
@@ -818,7 +825,7 @@ def cmd_seq_wpcount(sender, args):
     """Set active waypoint count. Usage: seq.wpcount <n>"""
     n = int(args[0]) if args else 7
     payload = struct.pack("<HH", n, 0)
-    sender.send(WOK_SEQ_CMD_MID, 8, payload, label=f"SEQ WP_COUNT {n}")
+    sender.send(WOK_SEQ_CMD_MID, SEQ_SET_WP_COUNT_CC, payload, label=f"SEQ WP_COUNT {n}")
 
 def cmd_seq_waypoint(sender, args):
     """Set waypoint index override. Usage: seq.waypoint <index>"""
@@ -1180,6 +1187,10 @@ def cmd_drill_sample(sender, args):
     sender.send(WOK_DRILL_CMD_MID, DRILL_START_SAMPLE_CC, payload,
                 label=f"DRILL SAMPLE heat={heat}s cool={cool}s")
 
+def cmd_drill_stopsample(sender, args):
+    """Stop the thermal vaporization cycle (heater off, cell cools)"""
+    sender.send(WOK_DRILL_CMD_MID, DRILL_STOP_SAMPLE_CC, SID, label="DRILL STOP_SAMPLE")
+
 def cmd_drill_abort(sender, args):
     """Emergency stop all drill operations"""
     sender.send(WOK_DRILL_CMD_MID, DRILL_ESTOP_CC, SID, label="DRILL EMERGENCY_STOP")
@@ -1529,7 +1540,7 @@ def test_seis(sender, tlm, args):
     raw = t.wait_tlm(WOK_SEIS_STATUS_TLM_MID)
     t.check("SEIS NOOP — status TLM received", raw is not None)
 
-    # START ACQ (v2.5 payload: site pose + stack fields)
+    # START ACQ (payload: site pose + stack fields)
     payload = SID + struct.pack("<HHBBHfffHH", 10, 500, 1, 0x0F, 0,
                                 0.0, 0.0, 0.0, 0, 1)
     sender.send(WOK_SEIS_CMD_MID, SEIS_START_ACQ_CC, payload,
@@ -1777,6 +1788,7 @@ SENDER_COMMANDS = OrderedDict([
     ("drill.start",   cmd_drill_start),
     ("drill.stop",    cmd_drill_stop),
     ("drill.sample",  cmd_drill_sample),
+    ("drill.stopsample", cmd_drill_stopsample),
     ("drill.abort",   cmd_drill_abort),
     ("drill.hk",      cmd_drill_hk),
 
@@ -1893,6 +1905,7 @@ def print_help():
     print(f"  drill.stop            Stop drill motor")
     print(f"  drill.sample [heat_s] [cool_s]")
     print(f"                        Thermal vaporization (default 60s 30s)")
+    print(f"  drill.stopsample      Stop the vaporization cycle")
     print(f"  drill.abort           Emergency stop all drill ops")
     print(f"  drill.hk              Request HK telemetry")
     print()

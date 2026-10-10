@@ -22,7 +22,7 @@
 **   spot (a fresh seat attempt). RetrievePod recaptures and stows it;
 **   recapture confirmation is the pod reading WOK_HAL_GEO_POD_STOWED
 **   again (CP-6). GetPodSeating exposes the seating-force channel —
-**   the arm force-feedback PROXY of coupling quality (§4.2): gate on
+**   the arm force-feedback PROXY of coupling quality: gate on
 **   it cheaply, but the active test shot stays the arbiter.
 */
 

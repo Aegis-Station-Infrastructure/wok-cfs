@@ -15,22 +15,34 @@ static WOK_Geo_AppData_t WOK_Geo_AppData;
 static void     WOK_Geo_UpdateFromHAL(void);
 static void     WOK_Geo_RunFaultDetection(void);
 static void     WOK_Geo_RunPodMachine(void);
-static uint32_t WOK_Geo_GetTimeMs(void);
+static uint32 WOK_Geo_GetTimeMs(void);
 
 void WOK_Geo_AppMain(void)
 {
     int32 Status; CFE_SB_Buffer_t *BufPtr = NULL;
     CFE_ES_PerfLogEntry(WOK_GEO_PERF_ID);
+    WOK_Geo_AppData.RunStatus = CFE_ES_RunStatus_APP_RUN;
     Status = WOK_Geo_AppInit();
-    if (Status != CFE_SUCCESS) return;
-    while (true) {
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_ES_WriteToSysLog("WOK_GEO: Init failed (0x%08lX)\n", (unsigned long)Status);
+        WOK_Geo_AppData.RunStatus = CFE_ES_RunStatus_APP_ERROR;
+    }
+    while (CFE_ES_RunLoop(&WOK_Geo_AppData.RunStatus) == true) {
         CFE_ES_PerfLogExit(WOK_GEO_PERF_ID);
         Status = CFE_SB_ReceiveBuffer(&BufPtr, WOK_Geo_AppData.CmdPipe, CFE_SB_PEND_FOREVER);
         CFE_ES_PerfLogEntry(WOK_GEO_PERF_ID);
         if (Status == CFE_SUCCESS) WOK_Geo_ProcessCommandPacket(BufPtr);
-        else break;
+        else
+        {
+            CFE_EVS_SendEvent(WOK_GEO_PIPE_ERR_EID, CFE_EVS_EventType_ERROR,
+                              "WOK_GEO: SB pipe error (0x%08lX), app will exit",
+                              (unsigned long)Status);
+            WOK_Geo_AppData.RunStatus = CFE_ES_RunStatus_APP_ERROR;
+        }
     }
-    CFE_ES_ExitApp(CFE_ES_RunStatus_APP_ERROR);
+    CFE_ES_PerfLogExit(WOK_GEO_PERF_ID);
+    CFE_ES_ExitApp(WOK_Geo_AppData.RunStatus);
 }
 
 int32 WOK_Geo_AppInit(void)
@@ -41,8 +53,20 @@ int32 WOK_Geo_AppInit(void)
     Status = CFE_SB_CreatePipe(&WOK_Geo_AppData.CmdPipe, WOK_GEO_PIPE_DEPTH, WOK_GEO_PIPE_NAME);
     if (Status != CFE_SUCCESS) return Status;
 
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_GEO_CMD_MID),     WOK_Geo_AppData.CmdPipe);
-    CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_GEO_SEND_HK_MID), WOK_Geo_AppData.CmdPipe);
+    Status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_GEO_CMD_MID), WOK_Geo_AppData.CmdPipe);
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(WOK_GEO_SUB_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "WOK_GEO: Subscribe to CMD failed (0x%08lX)", (unsigned long)Status);
+        return Status;
+    }
+    Status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(WOK_GEO_SEND_HK_MID), WOK_Geo_AppData.CmdPipe);
+    if (Status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(WOK_GEO_SUB_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "WOK_GEO: Subscribe to SEND_HK failed (0x%08lX)", (unsigned long)Status);
+        return Status;
+    }
 
     CFE_MSG_Init(CFE_MSG_PTR(WOK_Geo_AppData.HkTlm.TlmHeader),
                  CFE_SB_ValueToMsgId(WOK_GEO_TLM_MID), sizeof(WOK_Geo_HkTlm_t));
@@ -69,15 +93,15 @@ int32 WOK_Geo_AppInit(void)
     WOK_HAL_Geo_Init();
 
     CFE_EVS_SendEvent(WOK_GEO_INIT_INF_EID, CFE_EVS_EventType_INFORMATION,
-                      "WOK_GEO: App initialised (v2.0.0)");
+                      "WOK_GEO: App initialised (v" WOK_VERSION_STRING ")");
     return CFE_SUCCESS;
 }
 
 /* Read HAL state on every HK cycle */
 static void WOK_Geo_UpdateFromHAL(void)
 {
-    uint8_t halState = 0;
-    uint8_t depEnd = 0, stowEnd = 0;
+    uint8 halState = 0;
+    uint8 depEnd = 0, stowEnd = 0;
 
     WOK_HAL_Geo_GetState(&halState);
     WOK_HAL_Geo_GetEndstops(&depEnd, &stowEnd);
@@ -93,18 +117,18 @@ static void WOK_Geo_UpdateFromHAL(void)
 
 /* Millisecond timestamp from cFE TIME. uint64 multiply prevents overflow
  * before final uint32 truncation; delta arithmetic is mod-2^32 correct. */
-static uint32_t WOK_Geo_GetTimeMs(void)
+static uint32 WOK_Geo_GetTimeMs(void)
 {
     CFE_TIME_SysTime_t t = CFE_TIME_GetTime();
-    return (uint32_t)((uint64_t)t.Seconds * 1000ull + t.Subseconds / 4294967u);
+    return (uint32)((uint64)t.Seconds * 1000ull + t.Subseconds / 4294967u);
 }
 
 /* Elapsed ms since *start, robust to cFE TIME stepping backwards (the
  * early-boot FLYWHEEL correction): a negative delta would wrap mod 2^32
  * and trip an instant false timeout, so re-baseline *start instead. */
-static uint32_t WOK_Geo_ElapsedMs(uint32_t *start)
+static uint32 WOK_Geo_ElapsedMs(uint32 *start)
 {
-    uint32_t delta = WOK_Geo_GetTimeMs() - *start;
+    uint32 delta = WOK_Geo_GetTimeMs() - *start;
     if (delta > 0x80000000u)
     {
         *start += delta;  /* i.e. *start = now */
@@ -122,10 +146,10 @@ static void WOK_Geo_RunFaultDetection(void)
         return;
 
     bool deploying     = (WOK_Geo_AppData.MechState == WOK_GEO_DEPLOYING);
-    uint32_t elapsed   = WOK_Geo_ElapsedMs(&WOK_Geo_AppData.CmdStartMs);
-    uint16_t timeout   = deploying ? WOK_Geo_AppData.DeployTimeoutMs
+    uint32 elapsed   = WOK_Geo_ElapsedMs(&WOK_Geo_AppData.CmdStartMs);
+    uint16 timeout   = deploying ? WOK_Geo_AppData.DeployTimeoutMs
                                    : WOK_Geo_AppData.StowTimeoutMs;
-    uint8_t  endstop   = deploying ? WOK_Geo_AppData.EndstopDeployed
+    uint8  endstop   = deploying ? WOK_Geo_AppData.EndstopDeployed
                                    : WOK_Geo_AppData.EndstopStowed;
 
     if (elapsed > timeout && !endstop)
@@ -168,8 +192,8 @@ static void WOK_Geo_RunPodMachine(void)
     uint8 p = WOK_Geo_AppData.ActivePod;
     if (p >= WOK_HAL_GEO_MAX_PODS) return;
 
-    uint8_t  hal = 0;
-    uint32_t elapsed = WOK_Geo_ElapsedMs(&WOK_Geo_AppData.Pod[p].CmdStartMs);
+    uint8  hal = 0;
+    uint32 elapsed = WOK_Geo_ElapsedMs(&WOK_Geo_AppData.Pod[p].CmdStartMs);
     WOK_HAL_Geo_GetPodState(p, &hal);
 
     if (WOK_Geo_AppData.Pod[p].State == WOK_GEO_POD_PLACING)
@@ -177,7 +201,7 @@ static void WOK_Geo_RunPodMachine(void)
         if (hal == WOK_HAL_GEO_POD_PLACED)
         {
             float   force = 0.0f;
-            uint8_t att   = 0;
+            uint8 att   = 0;
             WOK_HAL_Geo_GetPodSeating(p, &force, &att);
             WOK_Geo_AppData.Pod[p].SeatForce_N = force;
 
@@ -272,7 +296,7 @@ void WOK_Geo_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                 WOK_Geo_AppData.LastSeqId = ((WOK_Geo_NoArgsCmd_t *)BufPtr)->SeqId;
                 WOK_Geo_AppData.CmdCounter++;
                 CFE_EVS_SendEvent(WOK_GEO_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION,
-                                  "WOK_GEO: NOOP (v2.0.0)");
+                                  "WOK_GEO: NOOP (v" WOK_VERSION_STRING ")");
             } break;
         case WOK_GEO_RESET_CTRS_CC:
             if (WOK_Geo_VerifyCmdLength(&BufPtr->Msg, sizeof(WOK_Geo_NoArgsCmd_t))) {
@@ -312,7 +336,7 @@ void WOK_Geo_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr)
                  * interrupted retrieval leaves it on the ground) */
                 for (uint8 p = 0; p < WOK_HAL_GEO_MAX_PODS; p++)
                 {
-                    uint8_t hal = 0;
+                    uint8 hal = 0;
                     if (WOK_Geo_AppData.Pod[p].State != WOK_GEO_POD_PLACING &&
                         WOK_Geo_AppData.Pod[p].State != WOK_GEO_POD_RETRIEVING)
                         continue;

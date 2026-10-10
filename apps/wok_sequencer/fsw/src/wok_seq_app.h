@@ -5,8 +5,8 @@
 /************************************************************************
 * WOK_SEQ — Application Private Header
 *
-* v2.1 — Reworked ops loop:
-*   MOVE → DEPLOY → THUMP → RECORD → EVALUATE → [DRILL] → STOW
+* App data for the mission state machine: waypoint table, per-site
+* survey record, cached child-app status, and pre-built child commands.
 ************************************************************************/
 #ifndef WOK_SEQ_APP_H
 #define WOK_SEQ_APP_H
@@ -23,28 +23,18 @@
 #include "wok_seis_msg.h"
 #include "wok_hk_msg.h"
 #include "wok_drill_msgids.h"
+#include "wok_drill_platform_cfg.h"   /* drill battery gate, heat/cool, arm angle */
 
 #define WOK_SEQ_PIPE_NAME   "WOK_SEQ_PIPE"
 
-/* SEQ subscribes to 7 MIDs (CMD + SEND_HK + 5 child TLM) — needs a deeper
- * pipe than the platform default. Override is explicit. */
-#undef  WOK_SEQ_PIPE_DEPTH
-#define WOK_SEQ_PIPE_DEPTH  32
-
-/* Hard-coded waypoint table for now (replace with cFE TBL later) */
+/* Default waypoint table; ground-uploadable via LOAD_WAYPOINT */
 #define WOK_SEQ_NUM_WAYPOINTS  7
 
-/* Battery threshold for drill ops (higher than normal 22.0V) */
-#define WOK_DRILL_MIN_BATTERY_V  23.5f
-
-/* Default drill parameters. Depth must punch through the ~1.5-2 m dry
+/* Sequencer drill targets. Depth must punch through the ~1.5-2 m dry
  * surface layer into the ice-bearing zone, or the vapor cell only ever
  * sees dry regolith and no seismic tie point is possible. */
 #define WOK_DRILL_DEFAULT_DEPTH_M   2.5f
 #define WOK_DRILL_DEFAULT_RPM       200.0f
-#define WOK_DRILL_DEFAULT_ANGLE_DEG 90.0f
-#define WOK_DRILL_DEFAULT_HEAT_SEC  60
-#define WOK_DRILL_DEFAULT_COOL_SEC  30
 
 /* ------------------------------------------------------------------ */
 /*  Drill sub-states (within the SEQ DRILL state)                     */
@@ -75,6 +65,7 @@ typedef enum
 typedef struct
 {
     CFE_SB_PipeId_t  CmdPipe;
+    uint32           RunStatus;
 
     /* Telemetry packets */
     WOK_Seq_HkTlm_t    HkTlm;
@@ -86,7 +77,6 @@ typedef struct
     uint16       WaypointIdx;
     uint16       TotalWaypoints;
     uint8        LoopCount;
-    uint8        RetryCount;
     uint16       FaultMask;
     bool         EnteredState;     /* true on first cycle of new state */
 
@@ -173,6 +163,12 @@ typedef struct
     WOK_Seis_StatusTlm_t  SeisStatus;
     WOK_Hk_HealthTlm_t    HkHealth;
     WOK_Drill_HkTlm_t     DrillHk;
+    /* One TLM-length-error event per child stream per boot; counted after */
+    uint8                 NavTlmLenErrReported;
+    uint8                 GeoTlmLenErrReported;
+    uint8                 SeisTlmLenErrReported;
+    uint8                 HkTlmLenErrReported;
+    uint8                 DrillTlmLenErrReported;
 
     /* Pre-built command packets for child apps */
     WOK_Nav_GoToCmd_t       NavGoToCmd;
@@ -213,7 +209,7 @@ int32 WOK_Seq_AppInit(void);
 void  WOK_Seq_ProcessCommandPacket(CFE_SB_Buffer_t *BufPtr);
 void  WOK_Seq_ProcessGroundCommand(CFE_SB_Buffer_t *BufPtr);
 void  WOK_Seq_ReportHousekeeping(void);
-void  WOK_Seq_RunStateMachine(CFE_SB_Buffer_t *BufPtr);
+void  WOK_Seq_RunStateMachine(void);
 void  WOK_Seq_CheckSafetyInhibits(void);
 void  WOK_Seq_CheckMissionEnd(void);
 void  WOK_Seq_ChangeState(WOK_State_t NewState);
@@ -242,5 +238,7 @@ void  WOK_Seq_SendDrillSample(void);
 void  WOK_Seq_SendDrillEstop(void);
 
 bool  WOK_Seq_VerifyCmdLength(CFE_MSG_Message_t *MsgPtr, size_t ExpectedLength);
+bool  WOK_Seq_VerifyTlmLength(const CFE_SB_Buffer_t *BufPtr, size_t ExpectedLength,
+                              uint8 *Reported);
 
 #endif /* WOK_SEQ_APP_H */

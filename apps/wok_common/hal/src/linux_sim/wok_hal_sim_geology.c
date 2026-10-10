@@ -114,11 +114,14 @@ float WOK_SimGeology_StrengthAt(float x_m, float y_m, float depth_m)
     return col[WOK_SIM_GEO_NLAYERS - 1].strength;
 }
 
-/* Release-mode centres/widths (Celsius) — see header for the physics */
-#define GEO_REL_ADSORBED_MU   110.0f
-#define GEO_REL_ADSORBED_SIG   20.0f
-#define GEO_REL_PORE_MU       160.0f
-#define GEO_REL_PORE_SIG       25.0f
+/* Release-mode centres/widths (Celsius) — see header for the physics.
+ * Ordered by binding energy: free (pore) ice evaporates first, around the
+ * boiling point at cell pressure; physisorbed films desorb above that;
+ * structurally bound water (hydrated minerals) needs 300 C and more. */
+#define GEO_REL_PORE_MU       100.0f
+#define GEO_REL_PORE_SIG       20.0f
+#define GEO_REL_ADSORBED_MU   160.0f
+#define GEO_REL_ADSORBED_SIG   30.0f
 #define GEO_REL_HYDRATED_MU   320.0f
 #define GEO_REL_HYDRATED_SIG   30.0f
 #define GEO_LENS_PORE_FRAC      0.85f  /* lens ice: pore vs hydrated  */

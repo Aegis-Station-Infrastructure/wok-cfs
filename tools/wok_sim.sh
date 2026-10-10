@@ -11,8 +11,10 @@
 #
 # Assumes the standard dev layout: cFS tree at ~/wok-cfs-build built+installed
 # (see WOK_Build_Install_Guide.md). Logs + PID files live in /tmp/wok_sim/.
-# The dashboard needs no LAN config — the URL is printed for localhost and
-# the machine's LAN address.
+# The bridge listens on 127.0.0.1 only (it has NO authentication); set
+# WOK_WS_HOST=0.0.0.0 to expose it on a trusted LAN, in which case the
+# LAN dashboard URL is printed too. WOK_WS_PORT overrides the bridge port
+# (the dashboard URL then carries ?ws=<port>).
 
 set -uo pipefail
 
@@ -21,6 +23,7 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 GROUND="$HERE/ground"
 RUN=/tmp/wok_sim
 WS_PORT="${WOK_WS_PORT:-8765}"
+WS_HOST="${WOK_WS_HOST:-127.0.0.1}"
 HTTP_PORT="${WOK_HTTP_PORT:-8090}"
 
 start_one() {  # name, workdir, command...
@@ -69,8 +72,8 @@ case "${1:-}" in
 
     start_one core   "$CFS_EXE" ./core-cpu1
     sleep 4   # let apps init before commanding
-    start_one bridge "$GROUND"  python3 wok_bridge.py --ws-port "$WS_PORT"
-    start_one http   "$GROUND"  python3 -m http.server "$HTTP_PORT" --directory "$GROUND"
+    start_one bridge "$GROUND"  python3 -u wok_bridge.py --ws-port "$WS_PORT" --ws-host "$WS_HOST"
+    start_one http   "$GROUND"  python3 -m http.server "$HTTP_PORT" --bind "$WS_HOST" --directory "$GROUND"
 
     # TO_LAB enable so the console/scripts see TLM even before a dashboard
     # client connects (the bridge re-sends it on every client connect).
@@ -84,11 +87,15 @@ EOF
     echo "  [+] TO_LAB enabled"
 
     LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    WS_QUERY=""
+    [ "$WS_PORT" != "8765" ] && WS_QUERY="?ws=${WS_PORT}"
     echo ""
-    echo "  Dashboard : http://127.0.0.1:${HTTP_PORT}/wok_index_html.html"
-    [ -n "$LAN_IP" ] && \
-    echo "        LAN : http://${LAN_IP}:${HTTP_PORT}/wok_index_html.html"
-    echo "  Bridge    : ws://127.0.0.1:${WS_PORT}"
+    echo "  Dashboard : http://127.0.0.1:${HTTP_PORT}/wok_index_html.html${WS_QUERY}"
+    if [ "$WS_HOST" = "0.0.0.0" ] && [ -n "$LAN_IP" ]; then
+    echo "        LAN : http://${LAN_IP}:${HTTP_PORT}/wok_index_html.html${WS_QUERY}"
+    echo "              (bridge exposed on the LAN with NO authentication)"
+    fi
+    echo "  Bridge    : ws://${WS_HOST}:${WS_PORT}"
     echo "  Console   : python3 $GROUND/wok_console.py"
     echo ""
     echo "  NOTE: the sim battery drains in real time (~28 min to the"
@@ -100,7 +107,13 @@ EOF
     stop_one http
     stop_one bridge
     stop_one core
-    pkill -x core-cpu1 2>/dev/null && echo "  [-] stray core-cpu1 killed" || true
+    # Stray core from THIS tree only (other cFS cores on the host may
+    # belong to someone else — match by /proc cwd, never pkill -x)
+    for p in $(pgrep -x core-cpu1); do
+        if [ "$(readlink /proc/$p/cwd 2>/dev/null)" = "$(readlink -f "$CFS_EXE")" ]; then
+            kill "$p" 2>/dev/null && echo "  [-] stray core-cpu1 ($p) killed"
+        fi
+    done
     # Stray bridges/servers not started by us (match by /proc cmdline —
     # pkill -f would match this script's own shell)
     for p in $(pgrep -x python3); do

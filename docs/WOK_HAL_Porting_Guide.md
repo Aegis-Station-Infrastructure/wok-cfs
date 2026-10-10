@@ -19,9 +19,11 @@ To port WOK to real hardware:
 
 1. Copy the `flight_stub/` files to a new target directory
 2. Replace each function body with real driver calls
-3. Point `wok_common/CMakeLists.txt` at your implementation files
-   instead of `linux_sim/` (see Step 4 of the walkthrough below —
-   there is no build-time switch; the CMakeLists edit *is* the switch)
+3. Select it with the `WOK_HAL_BACKEND` cache variable in
+   `wok_common/CMakeLists.txt`, which names the `hal/src/<backend>/`
+   directory to compile (`linux_sim` by default, `flight_stub`, or your
+   own name once you add it to the if/elseif there); see Step 4 of the
+   walkthrough
 
 The app logic is identical between desktop simulation and flight hardware — only the HAL implementation changes.
 
@@ -137,7 +139,7 @@ well the whole correction loop works:
 | `WOK_HAL_Geo_GetPodState(pod, *state)` | 0=STOWED(carried), 1=PLACING, 2=PLACED, 3=RETRIEVING |
 | `WOK_HAL_Geo_GetPodSeating(pod, *force_N, *attempt)` | Seating-force channel: peak arm force of the latest seat + attempt counter |
 
-**Typical hardware:** Legacy array: linear actuator or lead screw via H-bridge PWM, limit switches via GPIO, current sense ADC. Per-pod placement (the flight baseline, WOK-CP-001): a placement arm or dispenser with per-pod grippers/latches; the seating-force channel is the arm's press-force sensor (load cell or motor-current-derived) — the coupling-quality PROXY the GEO app gates on (`WOK_GEO_SEAT_FORCE_MIN_N`), with the seismic test shot as arbiter.
+**Typical hardware:** Legacy array: linear actuator or lead screw via H-bridge PWM, limit switches via GPIO, current sense ADC. Per-pod placement (the flight baseline): a placement arm or dispenser with per-pod grippers/latches; the seating-force channel is the arm's press-force sensor (load cell or motor-current-derived) — the coupling-quality PROXY the GEO app gates on (`WOK_GEO_SEAT_FORCE_MIN_N`), with the seismic test shot as arbiter.
 
 **Implementation notes:**
 
@@ -180,7 +182,7 @@ well the whole correction loop works:
 
 - `StartAcquisition` is non-blocking. Duration tracked internally.
 - **t₀ is electrical and the source drive and ADC must share one clock.** `GetStrikeInfo` returns the fire instant (impulse discharge, or the first pilot sample of a sweep) as a sample index in the active acquisition — the t₀ reference every first-break pick is measured against. Latch the ADC's sample counter with the discharge-switch gate edge / drive-start strobe in hardware; a software timestamp taken in the fire handler is NOT adequate at 4 kHz. There is no mechanical release detection anymore.
-- **Wireless pods (the flight baseline) void the shared-clock assumption** — this is the flagged porting-time contract evolution (WOK-CP-001/§6, Gap Analysis §11): `GetStrikeInfo` grows per-channel strike indices plus per-pod sync-quality/clock-error fields, and the picker consumes per-pod t₀. Budget guidance from the sim (CP-5): at a ±0.2 ms per-pod clock bias the pick chain stays within its ±0.5 ms spec; at ±1.0 ms it breaks. Size the RF-sync pulse / clock-discipline design to ~±0.25 ms or better. The test shot's sync/pick-consistency residuals (coup record) are the on-vehicle health check.
+- **Wireless pods (the flight baseline) void the shared-clock assumption** — this is the known porting-time contract evolution: `GetStrikeInfo` grows per-channel strike indices plus per-pod sync-quality/clock-error fields, and the picker consumes per-pod t₀. Budget guidance from the sim (CP-5): at a ±0.2 ms per-pod clock bias the pick chain stays within its ±0.5 ms spec; at ±1.0 ms it breaks. Size the RF-sync pulse / clock-discipline design to ~±0.25 ms or better. The test shot's sync/pick-consistency residuals (coup record) are the on-vehicle health check.
 - `Src_Arm`/`Src_Fire` enforce state transitions (IDLE→CHARGING→ARMED→FIRE). Charging draws from the main battery bus; the charger should inhibit (not brown out the bus) below `WOK_SRC_MIN_CHARGE_BATT_V` — the app-level arm timeout covers a bank that cannot reach target.
 - **The sweep pilot is part of the contract**: `WOK_HAL_Src_PilotSample()` (inline in `wok_hal_seis.h`) defines the exact waveform the driver must emit — a linear sweep with heavy Tukey tapers. The SEIS app regenerates it analytically for onboard correlation, so any deviation in the emitted pilot degrades every sweep-mode pick. Build the flight driver's waveform table by sampling that function at the drive rate.
 - `Evaluate` runs analysis on the most recent recorded data. In the sim it derives deterministically from the shared geology model at the configured site; a flight implementation should derive it from the recorded traces (pick-based apparent velocity) rather than porting the sim logic.
@@ -205,7 +207,7 @@ well the whole correction loop works:
 | `WOK_HAL_Drill_GetDepth(*m)` | Read current drill depth |
 | `WOK_HAL_Drill_GetRPM(*rpm)` | Read drill RPM |
 | `WOK_HAL_Drill_GetTorque(*nm)` | Read drill torque |
-| `WOK_HAL_Drill_GetWOB(*n)` | Read weight-on-bit (axial load cell) — with torque + ROP this forms the regolith stiffness log |
+| `WOK_HAL_Drill_GetWOB(*n)` | Read weight-on-bit (axial load cell) — with torque + ROP this forms the drilling-response log |
 | `WOK_HAL_Drill_GetMotorCurrent(*amps)` | Read drill motor current |
 | `WOK_HAL_Drill_GetSampleState(*state)` | 0=IDLE, 1=HEATING, 2=ANALYZING, 3=COOLING, 4=DONE |
 | `WOK_HAL_Drill_GetCellTemp(*c)` | Read sample cell temperature |
@@ -235,7 +237,7 @@ well the whole correction loop works:
 
 **Implementation notes:**
 
-- Called every HK cycle (1 Hz). Should be fast — read from cached register values, don't initiate a new conversion.
+- Called on every SEND_HK tick (~25 Hz with the stock SCH_LAB table). Should be fast — read from cached register values, don't initiate a new conversion.
 - The HK app uses these to detect BATTERY_LOW and TEMP_HIGH faults.
 
 ### Storage
@@ -278,7 +280,7 @@ Start with Power and Watchdog (easiest), then Geo, Mobility, Seis/Source, and Dr
 
 ### Step 4: Update CMakeLists
 
-Edit `~/wok-cfs-build/apps/wok_common/CMakeLists.txt` to use your implementation files.
+Set `WOK_HAL_BACKEND` to your directory name. The cFS top-level `make prep` does not forward extra `-D` options to the target sub-build, so either run `cmake -DWOK_HAL_BACKEND=my_target .` inside `build/native/default_cpu1` after `make prep`, or change the default in `apps/wok_common/CMakeLists.txt` (and extend its if/elseif with your backend name).
 
 ### Step 5: Build and Test
 

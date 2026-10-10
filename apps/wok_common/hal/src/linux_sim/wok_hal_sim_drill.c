@@ -9,7 +9,7 @@
 **   Arm:      3-second timed transitions, 2.0A during motion, 0.1A at rest
 **   Drill:    penetration + torque derived from the shared subsurface
 **             geology model (wok_hal_sim_geology.c) — ROP slows and torque
-**             rises in ice-cemented layers, so the drill's stiffness log
+**             rises in ice-cemented layers, so the drill's drilling-response log
 **             corroborates the seismic sim's velocity structure.
 **   Sampling: Heat at 5 C/s to 300C, hold 10s, cool at 3 C/s.
 **             Volatile conc = geology ice wt% at the latched sample depth
@@ -300,7 +300,7 @@ int32_t WOK_HAL_Drill_GetTorque(float *nm)
 
     if (g_drill_sim.drill_state == WOK_HAL_DRILL_MOTOR_DRILLING)
     {
-        /* Torque tracks geology strength at the bit (stiffness log),
+        /* Torque tracks geology strength at the bit (drilling-response log),
          * plus occasional bit-bind transients (5% chance). */
         float strength = WOK_SimGeology_StrengthAt(g_drill_sim.site_x_m,
                                                    g_drill_sim.site_y_m,
@@ -412,7 +412,7 @@ int32_t WOK_HAL_Drill_GetCellTemp(float *c)
             }
             /* Evolved-gas ramp: cumulative volatiles released so far is a
              * function of cell temperature and how the water is bound
-             * (adsorbed ~110C, pore ice ~160C, hydrated ~320C). The
+             * (pore ice ~100C, adsorbed ~160C, hydrated ~320C). The
              * (T, ppm) curve logged during this phase IS the binding
              * classification measurement. Total: 1 wt% = 10,000 ppm. */
             {
