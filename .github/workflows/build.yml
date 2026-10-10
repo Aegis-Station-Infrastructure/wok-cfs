@@ -1,0 +1,59 @@
+# Copyright 2026 Aegis Station Infrastructure LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build WOK against a clean NASA cFS v7.0.0 checkout, run the standalone
+# physics harness, boot the flight software, and check that all six WOK
+# apps initialise.
+
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cfs-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out WOK
+        uses: actions/checkout@v4
+        with:
+          path: wok-cfs
+
+      - name: Check out NASA cFS v7.0.0
+        run: |
+          git clone --branch v7.0.0 --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/nasa/cFS.git cfs
+          cd cfs
+          cp cfe/cmake/Makefile.sample Makefile
+          cp -r cfe/cmake/sample_defs sample_defs
+
+      - name: Host prerequisites
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q cmake build-essential
+          sudo sysctl fs.mqueue.msg_max=128
+
+      - name: Install WOK into the cFS tree
+        run: |
+          cd wok-cfs
+          ./install.sh "$GITHUB_WORKSPACE/cfs"
+
+      - name: Standalone physics harness
+        run: |
+          cd wok-cfs
+          bash tools/run_src_harness.sh
+
+      - name: Build cFS + WOK
+        run: |
+          cd cfs
+          make SIMULATION=native prep
+          make -j"$(nproc)"
+          make install
+          ls build/exe/cpu1/cf/wok_*.so
+
+      - name: Boot the flight software and check app init
+        run: |
+          cd wok-cfs
+          bash tools/smoke_test.sh "$GITHUB_WORKSPACE/cfs/build/exe/cpu1"

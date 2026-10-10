@@ -1,0 +1,14 @@
+Add these entries to sch_lab/fsw/tables/sch_lab_table.c, inside the
+.Config array, before the {CFE_SB_MSGID_RESERVED, 0, 0} terminator:
+
+    /* WOK Mission SEND_HK wakeups (every 4th tick) */
+    {CFE_SB_MSGID_WRAP_VALUE(0x18D1), 4, 0},  /* SEQ SEND_HK   */
+    {CFE_SB_MSGID_WRAP_VALUE(0x18D3), 4, 0},  /* NAV SEND_HK   */
+    {CFE_SB_MSGID_WRAP_VALUE(0x18D5), 4, 0},  /* GEO SEND_HK   */
+    {CFE_SB_MSGID_WRAP_VALUE(0x18D7), 4, 0},  /* SEIS SEND_HK  */
+    {CFE_SB_MSGID_WRAP_VALUE(0x18D9), 4, 0},  /* HK SEND_HK    */
+    {CFE_SB_MSGID_WRAP_VALUE(0x18DB), 4, 0},  /* DRILL SEND_HK */
+
+install.sh applies this edit automatically; this file is the reference
+for doing it by hand. Without these entries the WOK apps never receive
+SEND_HK and the sequencer state machine never advances out of IDLE.

@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<!-- Copyright 2026 Aegis Station Infrastructure LLC
+     SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WOK Ground Control</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #010409; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    // ─── CONFIG ────────────────────────────────────────────────────────────
+    // Bridge runs on the same host that serves this page (wok_sim.sh).
+    const WS_URL = `ws://${window.location.hostname || "127.0.0.1"}:8765`;
+    const RECONNECT_INTERVAL = 3000;
+
+    // ─── STATE MACHINE DEFINITIONS ─────────────────────────────────────────
+    const SEQ_STATES = ["IDLE", "MOVE", "DEPLOY", "THUMP", "RECORD", "EVALUATE", "DRILL", "STOW", "SAFE", "DONE", "VERIFY", "HOLD"];
+    const SEQ_STATE_COLORS = {
+      IDLE: "#5a6577", MOVE: "#3b82f6", DEPLOY: "#f59e0b", THUMP: "#8b5cf6",
+      RECORD: "#10b981", EVALUATE: "#f97316", DRILL: "#06b6d4", STOW: "#f59e0b",
+      SAFE: "#ef4444", DONE: "#6b7280", VERIFY: "#a855f7", HOLD: "#eab308",
+    };
+    const SEQ_TRANSITIONS = [
+      [0,1],[1,2],[1,11],[11,2],[2,10],[10,3],[2,3],[3,4],[4,5],[5,6],[5,7],[6,7],[7,1],[7,9],
+    ];
+
+    // ─── HOOK: WebSocket ───────────────────────────────────────────────────
+    function useWokSocket() {
+      const [connected, setConnected] = useState(false);
+      const [tlm, setTlm] = useState({});
+      const [cmdLog, setCmdLog] = useState([]);
+      const wsRef = useRef(null);
+      const reconnectRef = useRef(null);
+
+      const connect = useCallback(() => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) return;
+        const ws = new WebSocket(WS_URL);
+        ws.onopen = () => { setConnected(true); };
+        ws.onclose = () => {
+          setConnected(false);
+          reconnectRef.current = setTimeout(connect, RECONNECT_INTERVAL);
+        };
+        ws.onerror = () => ws.close();
+        ws.onmessage = (evt) => {
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg.type === "telemetry") {
+              setTlm(prev => ({ ...prev, [msg.mid]: { ...msg.data, _ts: msg.timestamp } }));
+            } else if (msg.type === "tlm_snapshot") {
+              const snap = {};
+              for (const [k,v] of Object.entries(msg.data)) {
+                snap[k] = { ...v, _ts: msg.timestamp };
+              }
+              setTlm(prev => ({ ...prev, ...snap }));
+            } else if (msg.type === "cmd_ack") {
+              setCmdLog(prev => [{ ...msg, _ts: Date.now() / 1000 }, ...prev].slice(0, 50));
+            }
+          } catch {}
+        };
+        wsRef.current = ws;
+      }, []);
+
+      useEffect(() => {
+        connect();
+        return () => {
+          clearTimeout(reconnectRef.current);
+          wsRef.current?.close();
+        };
+      }, [connect]);
+
+      const sendCmd = useCallback((app, action, params) => {
+        if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+        wsRef.current.send(JSON.stringify({ type: "command", app, action, params }));
+      }, []);
+
+      const sendMacro = useCallback((type) => {
+        if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+        wsRef.current.send(JSON.stringify({ type }));
+      }, []);
+
+      return { connected, tlm, cmdLog, sendCmd, sendMacro };
+    }
+
+    // ─── COMPONENTS ────────────────────────────────────────────────────────
+
+    function StatusDot({ active, color = "#10b981" }) {
+      return (
+        <span style={{
+          display: "inline-block", width: 8, height: 8, borderRadius: "50%",
+          background: active ? color : "#374151",
+          boxShadow: active ? `0 0 8px ${color}88` : "none",
+          marginRight: 6, flexShrink: 0,
+        }} />
+      );
+    }
+
+    function Badge({ children, color = "#3b82f6", pulse = false }) {
+      return (
+        <span style={{
+          display: "inline-flex", alignItems: "center", padding: "2px 10px",
+          borderRadius: 4, fontSize: 11, fontWeight: 700, letterSpacing: 1,
+          fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+          background: `${color}22`, color, border: `1px solid ${color}44`,
+          animation: pulse ? "pulse-badge 1.5s ease-in-out infinite" : "none",
+        }}>
+          {children}
+        </span>
+      );
+    }
+
+    function Panel({ title, icon, children, accent = "#3b82f6", span = 1 }) {
+      return (
+        <div style={{
+          background: "#0d1117", border: "1px solid #1e2733", borderRadius: 8,
+          overflow: "hidden", gridColumn: `span ${span}`,
+          display: "flex", flexDirection: "column",
+        }}>
+          <div style={{
+            display: "flex", alignItems: "center", gap: 8, padding: "10px 16px",
+            borderBottom: "1px solid #1e2733",
+            background: `linear-gradient(90deg, ${accent}08, transparent)`,
+          }}>
+            <span style={{ fontSize: 14 }}>{icon}</span>
+            <span style={{
+              fontSize: 11, fontWeight: 700, letterSpacing: 1.5,
+              textTransform: "uppercase", color: "#8b949e",
+              fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+            }}>{title}</span>
+          </div>
+          <div style={{ padding: 16, flex: 1, minHeight: 0 }}>
+            {children}
+          </div>
+        </div>
+      );
+    }
+
+    function TlmValue({ label, value, unit = "", warn = false, danger = false }) {
+      const color = danger ? "#ef4444" : warn ? "#f59e0b" : "#e6edf3";
+      return (
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "3px 0" }}>
+          <span style={{ fontSize: 11, color: "#6e7681", fontFamily: "'JetBrains Mono', monospace" }}>{label}</span>
+          <span style={{
+            fontSize: 13, fontWeight: 600, color, fontFamily: "'JetBrains Mono', monospace",
+            textShadow: danger ? "0 0 8px #ef444466" : "none",
+          }}>
+            {value}{unit && <span style={{ fontSize: 10, color: "#6e7681", marginLeft: 3 }}>{unit}</span>}
+          </span>
+        </div>
+      );
+    }
+
+    function CmdButton({ label, onClick, color = "#3b82f6", small = false, disabled = false, danger = false }) {
+      const bg = danger ? "#ef4444" : color;
+      return (
+        <button
+          onClick={onClick}
+          disabled={disabled}
+          style={{
+            padding: small ? "4px 10px" : "6px 14px",
+            fontSize: small ? 10 : 11, fontWeight: 700, letterSpacing: 0.5,
+            fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+            textTransform: "uppercase",
+            background: disabled ? "#21262d" : `${bg}18`,
+            color: disabled ? "#484f58" : bg,
+            border: `1px solid ${disabled ? "#30363d" : bg + "55"}`,
+            borderRadius: 4, cursor: disabled ? "not-allowed" : "pointer",
+            transition: "all 0.15s",
+          }}
+          onMouseEnter={e => { if (!disabled) { e.target.style.background = `${bg}33`; e.target.style.boxShadow = `0 0 12px ${bg}22`; }}}
+          onMouseLeave={e => { e.target.style.background = disabled ? "#21262d" : `${bg}18`; e.target.style.boxShadow = "none"; }}
+        >
+          {label}
+        </button>
+      );
+    }
+
+    // ─── STATE MACHINE VISUALIZATION ───────────────────────────────────────
+    function StateMachineViz({ currentState }) {
+      const nodeW = 68, nodeH = 26, gapX = 82, gapY = 48;
+      const positions = {
+        IDLE: [0, 0], MOVE: [1, 0], DEPLOY: [2, 0], THUMP: [3, 0], RECORD: [4, 0],
+        EVALUATE: [4, 1], DRILL: [3, 1], STOW: [2, 1], SAFE: [0, 1], DONE: [1, 1],
+        HOLD: [1.5, 2], VERIFY: [2.5, 2],
+      };
+      const padX = 16, padY = 14;
+      const svgW = 5 * gapX + padX * 2 - (gapX - nodeW);
+      const svgH = 3 * gapY + padY * 2 - (gapY - nodeH);
+      const edges = [
+        ["IDLE","MOVE"],["MOVE","DEPLOY"],["DEPLOY","THUMP"],["THUMP","RECORD"],
+        ["RECORD","EVALUATE"],["EVALUATE","DRILL"],["EVALUATE","STOW"],
+        ["DRILL","STOW"],["STOW","MOVE"],["STOW","DONE"],
+        ["MOVE","HOLD"],["HOLD","DEPLOY"],["DEPLOY","VERIFY"],["VERIFY","THUMP"],
+      ];
+      const cx = (s) => positions[s][0] * gapX + padX + nodeW/2;
+      const cy = (s) => positions[s][1] * gapY + padY + nodeH/2;
+
+      return (
+        <svg viewBox={`0 0 ${svgW} ${svgH}`} style={{ width: "100%", maxHeight: 140 }}>
+          <defs>
+            <marker id="ah" markerWidth="6" markerHeight="4" refX="6" refY="2" orient="auto">
+              <polygon points="0 0, 6 2, 0 4" fill="#30363d" />
+            </marker>
+            <marker id="ah-active" markerWidth="6" markerHeight="4" refX="6" refY="2" orient="auto">
+              <polygon points="0 0, 6 2, 0 4" fill="#58a6ff" />
+            </marker>
+          </defs>
+          {edges.map(([a, b], i) => {
+            const x1 = cx(a), y1 = cy(a), x2 = cx(b), y2 = cy(b);
+            const isActive = a === currentState;
+            const dx = x2 - x1, dy = y2 - y1;
+            const len = Math.sqrt(dx*dx + dy*dy);
+            const ux = dx/len, uy = dy/len;
+            const sx = x1 + ux * (nodeW/2 + 2), sy = y1 + uy * (nodeH/2 + 2);
+            const ex = x2 - ux * (nodeW/2 + 6), ey = y2 - uy * (nodeH/2 + 6);
+            return (
+              <line key={i} x1={sx} y1={sy} x2={ex} y2={ey}
+                stroke={isActive ? "#58a6ff" : "#21262d"} strokeWidth={isActive ? 1.5 : 1}
+                markerEnd={isActive ? "url(#ah-active)" : "url(#ah)"}
+                strokeDasharray={isActive ? "none" : "3 3"}
+              />
+            );
+          })}
+          {currentState === "SAFE" && (
+            <circle cx={cx("SAFE")} cy={cy("SAFE")} r={nodeW/2 + 6}
+              fill="none" stroke="#ef4444" strokeWidth={1} strokeDasharray="4 3" opacity={0.5} />
+          )}
+          {SEQ_STATES.map((s) => {
+            const x = positions[s][0] * gapX + padX;
+            const y = positions[s][1] * gapY + padY;
+            const active = s === currentState;
+            const col = SEQ_STATE_COLORS[s];
+            return (
+              <g key={s}>
+                <rect x={x} y={y} width={nodeW} height={nodeH} rx={4}
+                  fill={active ? `${col}22` : "#0d1117"}
+                  stroke={active ? col : "#21262d"} strokeWidth={active ? 1.5 : 1}
+                />
+                {active && <rect x={x} y={y} width={nodeW} height={nodeH} rx={4}
+                  fill="none" stroke={col} strokeWidth={1} opacity={0.3}>
+                  <animate attributeName="opacity" values="0.3;0.8;0.3" dur="2s" repeatCount="indefinite" />
+                </rect>}
+                <text x={x + nodeW/2} y={y + nodeH/2 + 1} textAnchor="middle" dominantBaseline="middle"
+                  fontSize={9} fontWeight={active ? 700 : 500} fill={active ? col : "#6e7681"}
+                  fontFamily="'JetBrains Mono', monospace" letterSpacing={0.5}>
+                  {s}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+      );
+    }
+
+    // ─── COMMAND PANEL ─────────────────────────────────────────────────────
+    function CommandPanel({ sendCmd, sendMacro, connected }) {
+      const [navX, setNavX] = useState("10");
+      const [navY, setNavY] = useState("0");
+      const [seisDur, setSeisDur] = useState("60");
+      const [seisFs, setSeisFs] = useState("1000");
+      const [srcMode, setSrcMode] = useState("0");
+      const [srcEnergy, setSrcEnergy] = useState("0");
+      const [drillAngle, setDrillAngle] = useState("90");
+      const [drillDepth, setDrillDepth] = useState("1.0");
+      const [drillRpm, setDrillRpm] = useState("200");
+      const [drillHeat, setDrillHeat] = useState("60");
+      const [drillCool, setDrillCool] = useState("30");
+
+      const inputStyle = {
+        width: 46, padding: "3px 5px", fontSize: 10, fontFamily: "'JetBrains Mono', monospace",
+        background: "#0d1117", color: "#e6edf3", border: "1px solid #30363d",
+        borderRadius: 3, textAlign: "center",
+      };
+
+      const secLabel = { fontSize: 9, color: "#6e7681", marginBottom: 4, fontWeight: 600, letterSpacing: 1, fontFamily: "'JetBrains Mono', monospace" };
+
+      return (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px 16px" }}>
+          <div>
+            <div style={secLabel}>MACROS</div>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+              <CmdButton label="All NOOP" onClick={() => sendMacro("allnoop")} disabled={!connected} small />
+              <CmdButton label="All HK" onClick={() => sendMacro("allhk")} disabled={!connected} small />
+              <CmdButton label="⛑ Safe Stop" onClick={() => sendMacro("safestop")} disabled={!connected} danger small />
+            </div>
+          </div>
+          <div>
+            <div style={secLabel}>SEQUENCER</div>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+              <CmdButton label="Start" onClick={() => sendCmd("seq","start")} color="#10b981" disabled={!connected} small />
+              <CmdButton label="Abort" onClick={() => sendCmd("seq","abort")} disabled={!connected} danger small />
+              <CmdButton label="Resume" onClick={() => sendCmd("seq","resume")} color="#8b5cf6" disabled={!connected} small />
+            </div>
+          </div>
+          <div>
+            <div style={secLabel}>NAVIGATION</div>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
+              <CmdButton label="GoTo" onClick={() => sendCmd("nav","goto",{x:parseFloat(navX),y:parseFloat(navY)})} disabled={!connected} small />
+              <input style={inputStyle} value={navX} onChange={e => setNavX(e.target.value)} />
+              <input style={inputStyle} value={navY} onChange={e => setNavY(e.target.value)} />
+              <CmdButton label="Stop" onClick={() => sendCmd("nav","stop")} disabled={!connected} danger small />
+            </div>
+          </div>
+          <div>
+            <div style={secLabel}>GEOPHONE</div>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+              <CmdButton label="Deploy" onClick={() => sendCmd("geo","deploy")} color="#f59e0b" disabled={!connected} small />
+              <CmdButton label="Stow" onClick={() => sendCmd("geo","stow")} color="#f59e0b" disabled={!connected} small />
+              <CmdButton label="E-Stop" onClick={() => sendCmd("geo","abort")} disabled={!connected} danger small />
+            </div>
+          </div>
+          <div>
+            <div style={secLabel}>SEISMIC</div>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
+              <CmdButton label="Acquire" onClick={() => sendCmd("seis","start",{duration:parseInt(seisDur),fs:parseInt(seisFs)})} color="#10b981" disabled={!connected} small />
+              <input style={inputStyle} value={seisDur} onChange={e => setSeisDur(e.target.value)} />
+              <input style={inputStyle} value={seisFs} onChange={e => setSeisFs(e.target.value)} />
+              <CmdButton label="Stop" onClick={() => sendCmd("seis","stop")} disabled={!connected} danger small />
+            </div>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center", marginTop: 4 }}>
+              {/* EM source: mode (impulse/sweep) + impulse energy (0 = flight default).
+                  Sweep band/duration keep the onboard defaults (zeros in the cmd). */}
+              <select style={{ ...inputStyle, width: 72 }} value={srcMode}
+                onChange={e => setSrcMode(e.target.value)}>
+                <option value="0">IMPULSE</option>
+                <option value="1">SWEEP</option>
+              </select>
+              <input style={inputStyle} value={srcEnergy} onChange={e => setSrcEnergy(e.target.value)} title="energy J (0=default)" />
+              <CmdButton label="Set Source" onClick={() => sendCmd("seis","source",{mode:parseInt(srcMode),energy_j:parseFloat(srcEnergy)})} color="#10b981" disabled={!connected} small />
+            </div>
+          </div>
+          <div>
+            <div style={secLabel}>HEALTH</div>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+              <CmdButton label="Clear Faults" onClick={() => sendCmd("hk","clear")} color="#f59e0b" disabled={!connected} small />
+              <CmdButton label="NOOP" onClick={() => sendCmd("hk","noop")} disabled={!connected} small />
+            </div>
+          </div>
+          <div style={{ gridColumn: "span 2" }}>
+            <div style={secLabel}>DRILL / ICE PROSPECTOR</div>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
+              <CmdButton label="Deploy" onClick={() => sendCmd("drill","deploy",{angle:parseFloat(drillAngle)})} color="#06b6d4" disabled={!connected} small />
+              <input style={inputStyle} value={drillAngle} onChange={e => setDrillAngle(e.target.value)} title="angle" />
+              <CmdButton label="Stow" onClick={() => sendCmd("drill","stow")} color="#06b6d4" disabled={!connected} small />
+              <span style={{ width: 1, height: 16, background: "#21262d", margin: "0 2px" }} />
+              <CmdButton label="Drill" onClick={() => sendCmd("drill","start",{depth:parseFloat(drillDepth),rpm:parseFloat(drillRpm)})} color="#06b6d4" disabled={!connected} small />
+              <input style={inputStyle} value={drillDepth} onChange={e => setDrillDepth(e.target.value)} title="depth" />
+              <input style={inputStyle} value={drillRpm} onChange={e => setDrillRpm(e.target.value)} title="rpm" />
+              <CmdButton label="Stop" onClick={() => sendCmd("drill","stop")} disabled={!connected} danger small />
+              <span style={{ width: 1, height: 16, background: "#21262d", margin: "0 2px" }} />
+              <CmdButton label="Sample" onClick={() => sendCmd("drill","sample",{heat_sec:parseInt(drillHeat),cool_sec:parseInt(drillCool)})} color="#06b6d4" disabled={!connected} small />
+              <input style={inputStyle} value={drillHeat} onChange={e => setDrillHeat(e.target.value)} title="heat_s" />
+              <input style={inputStyle} value={drillCool} onChange={e => setDrillCool(e.target.value)} title="cool_s" />
+              <CmdButton label="E-Stop" onClick={() => sendCmd("drill","abort")} disabled={!connected} danger small />
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── HEALTH GAUGES ─────────────────────────────────────────────────────
+    function MiniGauge({ label, value, min, max, unit, warnLow, dangerLow, warnHigh, dangerHigh }) {
+      const pct = Math.max(0, Math.min(100, ((value - min) / (max - min)) * 100));
+      let color = "#10b981";
+      if (dangerLow != null && value < dangerLow) color = "#ef4444";
+      else if (warnLow != null && value < warnLow) color = "#f59e0b";
+      else if (dangerHigh != null && value > dangerHigh) color = "#ef4444";
+      else if (warnHigh != null && value > warnHigh) color = "#f59e0b";
+      return (
+        <div style={{ flex: 1, minWidth: 90 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+            <span style={{ fontSize: 9, color: "#6e7681", fontFamily: "'JetBrains Mono', monospace" }}>{label}</span>
+            <span style={{ fontSize: 11, fontWeight: 700, color, fontFamily: "'JetBrains Mono', monospace" }}>
+              {value != null ? value : "--"}{unit}
+            </span>
+          </div>
+          <div style={{ height: 4, background: "#21262d", borderRadius: 2 }}>
+            <div style={{
+              height: "100%", borderRadius: 2, background: color,
+              width: `${value != null ? pct : 0}%`, transition: "width 0.5s, background 0.5s",
+              boxShadow: `0 0 6px ${color}44`,
+            }} />
+          </div>
+        </div>
+      );
+    }
+
+    // ─── CMD LOG ───────────────────────────────────────────────────────────
+    function CmdLog({ log }) {
+      return (
+        <div style={{ maxHeight: 140, overflowY: "auto", fontSize: 10, fontFamily: "'JetBrains Mono', monospace" }}>
+          {log.length === 0 && <div style={{ color: "#484f58", padding: 8 }}>No commands sent yet</div>}
+          {log.map((entry, i) => (
+            <div key={i} style={{
+              padding: "3px 0", borderBottom: "1px solid #161b22",
+              display: "flex", gap: 8, color: entry.status === "ok" ? "#8b949e" : "#ef4444",
+            }}>
+              <span style={{ color: "#30363d" }}>{new Date(entry._ts * 1000).toLocaleTimeString()}</span>
+              <span style={{ color: entry.status === "ok" ? "#3fb950" : "#ef4444" }}>
+                {entry.status === "ok" ? "✓" : "✗"}
+              </span>
+              <span>{entry.app?.toUpperCase()}.{entry.action?.toUpperCase() || entry.action}</span>
+              {entry.size && <span style={{ color: "#484f58" }}>{entry.size}B</span>}
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // ─── SEISMIC CHANNEL BARS ──────────────────────────────────────────────
+    function SeisChannelBars({ channels }) {
+      if (!channels || channels.length === 0) {
+        return <div style={{ color: "#484f58", fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>No acquisition data</div>;
+      }
+      const maxPeak = Math.max(...channels.map(c => c.peak), 1);
+      return (
+        <div style={{ display: "flex", gap: 12, alignItems: "flex-end", height: 60 }}>
+          {channels.map((ch) => {
+            const h = Math.max(4, (ch.rms / maxPeak) * 56);
+            const colors = ["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6"];
+            return (
+              <div key={ch.channel} style={{ flex: 1, textAlign: "center" }}>
+                <div style={{ height: 56, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+                  <div style={{
+                    width: "100%", maxWidth: 32, height: h, borderRadius: "3px 3px 0 0",
+                    background: `linear-gradient(180deg, ${colors[ch.channel]}cc, ${colors[ch.channel]}44)`,
+                    transition: "height 0.4s",
+                  }} />
+                </div>
+                <div style={{ fontSize: 9, color: "#6e7681", marginTop: 2, fontFamily: "'JetBrains Mono', monospace" }}>CH{ch.channel}</div>
+                <div style={{ fontSize: 9, color: colors[ch.channel], fontFamily: "'JetBrains Mono', monospace" }}>{ch.rms}</div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ─── NAV MAP ───────────────────────────────────────────────────────────
+    function NavMiniMap({ x, y, arrived, driving }) {
+      const waypoints = [[10,0],[10,10],[0,10],[0,0]];
+      const scale = 8, pad = 20;
+      const svgW = 12 * scale + pad * 2;
+      const svgH = 12 * scale + pad * 2;
+      const tx = (v) => v * scale + pad;
+      const ty = (v) => (10 - v) * scale + pad;
+      return (
+        <svg viewBox={`0 0 ${svgW} ${svgH}`} style={{ width: "100%", maxHeight: 130 }}>
+          {[0,2,4,6,8,10].map(v => (
+            <g key={v}>
+              <line x1={tx(0)} y1={ty(v)} x2={tx(10)} y2={ty(v)} stroke="#161b22" strokeWidth={0.5} />
+              <line x1={tx(v)} y1={ty(0)} x2={tx(v)} y2={ty(10)} stroke="#161b22" strokeWidth={0.5} />
+            </g>
+          ))}
+          <polyline points={waypoints.map(([wx,wy]) => `${tx(wx)},${ty(wy)}`).join(" ")}
+            fill="none" stroke="#21262d" strokeWidth={1} strokeDasharray="4 3" />
+          {waypoints.map(([wx,wy], i) => (
+            <g key={i}>
+              <circle cx={tx(wx)} cy={ty(wy)} r={4} fill="#0d1117" stroke="#30363d" strokeWidth={1} />
+              <text x={tx(wx)} y={ty(wy)+1} textAnchor="middle" dominantBaseline="middle"
+                fontSize={6} fill="#6e7681" fontFamily="'JetBrains Mono', monospace">{i}</text>
+            </g>
+          ))}
+          {x != null && y != null && (
+            <g>
+              <circle cx={tx(x)} cy={ty(y)} r={6} fill="#3b82f622" stroke="#3b82f6" strokeWidth={1.5}>
+                {driving && <animate attributeName="r" values="6;9;6" dur="1.5s" repeatCount="indefinite" />}
+              </circle>
+              <circle cx={tx(x)} cy={ty(y)} r={2.5} fill="#3b82f6" />
+            </g>
+          )}
+        </svg>
+      );
+    }
+
+    // ─── MAIN APP ──────────────────────────────────────────────────────────
+    function WokGroundControl() {
+      const { connected, tlm, cmdLog, sendCmd, sendMacro } = useWokSocket();
+
+      const seq = tlm["0x08D0"] || {};
+      const seqMode = tlm["0x08D1"] || {};
+      const navHk = tlm["0x08D2"] || {};
+      const navStatus = tlm["0x08D3"] || {};
+      const geoHk = tlm["0x08D4"] || {};
+      const geoStatus = tlm["0x08D5"] || {};
+      const seisHk = tlm["0x08D6"] || {};
+      const seisStatus = tlm["0x08D7"] || {};
+      const seisQl = tlm["0x08D8"] || {};
+      const hk = tlm["0x08D9"] || {};
+      const drillHk = tlm["0x08DA"] || {};
+      const drillStatus = tlm["0x08DB"] || {};
+
+      const hasFaults = hk.faults && hk.faults[0] !== "NONE";
+      const currentState = seq.state || seqMode.state || "IDLE";
+
+      return (
+        <div style={{
+          minHeight: "100vh", background: "#010409", color: "#e6edf3",
+          fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+        }}>
+          <style>{`
+            @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
+            @keyframes pulse-badge { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+            * { box-sizing: border-box; }
+            ::-webkit-scrollbar { width: 4px; }
+            ::-webkit-scrollbar-track { background: transparent; }
+            ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 2px; }
+            input:focus { outline: none; border-color: #3b82f6 !important; }
+          `}</style>
+
+          <header style={{
+            padding: "10px 24px", borderBottom: "1px solid #1e2733",
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+            background: "linear-gradient(180deg, #0d111788, #01040900)",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+                  <circle cx="12" cy="12" r="10" stroke="#3b82f6" strokeWidth="1.5" />
+                  <circle cx="12" cy="12" r="3" fill="#3b82f6" />
+                  <path d="M12 2v4M12 18v4M2 12h4M18 12h4" stroke="#3b82f6" strokeWidth="1" opacity="0.5" />
+                </svg>
+                <span style={{ fontSize: 15, fontWeight: 700, letterSpacing: 2 }}>WOK</span>
+                <span style={{ fontSize: 11, color: "#6e7681", fontWeight: 400 }}>GROUND CONTROL</span>
+              </div>
+              <div style={{ width: 1, height: 16, background: "#21262d" }} />
+              <Badge color={currentState === "SAFE" ? "#ef4444" : SEQ_STATE_COLORS[currentState] || "#6b7280"}
+                pulse={currentState === "SAFE"}>
+                {currentState}
+              </Badge>
+              {seqMode.total_waypoints > 0 && (
+                <span style={{ fontSize: 10, color: "#6e7681" }}>
+                  WP {seq.waypoint_idx ?? 0}/{seqMode.total_waypoints}
+                </span>
+              )}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+              {hasFaults && <Badge color="#ef4444" pulse>FAULT</Badge>}
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <StatusDot active={connected} color={connected ? "#3fb950" : "#ef4444"} />
+                <span style={{ fontSize: 10, color: connected ? "#3fb950" : "#ef4444" }}>
+                  {connected ? "CONNECTED" : "DISCONNECTED"}
+                </span>
+              </div>
+            </div>
+          </header>
+
+          <div style={{
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr 1fr",
+            gap: 12, padding: 16, maxWidth: 1400, margin: "0 auto",
+          }}>
+            <Panel title="Command & Control" icon="⌘" accent="#3b82f6" span={2}>
+              <CommandPanel sendCmd={sendCmd} sendMacro={sendMacro} connected={connected} />
+            </Panel>
+            <Panel title="Command Log" icon="⟫" accent="#6e7681">
+              <CmdLog log={cmdLog} />
+            </Panel>
+
+            <Panel title="Navigation" icon="◎" accent="#3b82f6">
+              <div style={{ display: "flex", gap: 16 }}>
+                <div style={{ flex: 1 }}>
+                  <TlmValue label="Position" value={navStatus.x != null ? `${navStatus.x}, ${navStatus.y}` : "--"} unit="m" />
+                  <TlmValue label="Heading" value={navStatus.heading ?? "--"} unit="°" />
+                  <TlmValue label="Speed" value={navStatus.speed ?? "--"} unit="m/s" />
+                  <TlmValue label="Tilt" value={navStatus.tilt ?? "--"} unit="°"
+                    warn={navStatus.tilt > 20} danger={navStatus.tilt > 30} />
+                  <TlmValue label="Drive" value={navStatus.drive_state ?? navHk.drive_state ?? "--"} />
+                  <TlmValue label="Arrived" value={navStatus.arrived != null ? (navStatus.arrived ? "YES" : "NO") : "--"} />
+                  <TlmValue label="Realigns" value={navStatus.realign_count ?? "--"} />
+                </div>
+                <div style={{ width: 130 }}>
+                  <NavMiniMap x={navStatus.x} y={navStatus.y}
+                    arrived={navStatus.arrived} driving={(navStatus.drive_state ?? navHk.drive_state) === "DRIVING"} />
+                </div>
+              </div>
+            </Panel>
+
+            <Panel title="Geophone" icon="⏚" accent="#f59e0b">
+              <TlmValue label="Mech State" value={geoStatus.mech_state ?? geoHk.mech_state ?? "--"} />
+              <TlmValue label="Endstop Deploy" value={geoStatus.endstop_deployed != null ? (geoStatus.endstop_deployed ? "HIT" : "—") : "--"} />
+              <TlmValue label="Endstop Stow" value={geoStatus.endstop_stowed != null ? (geoStatus.endstop_stowed ? "HIT" : "—") : "--"} />
+              <TlmValue label="Motor Current" value={geoStatus.motor_current_a ?? "--"} unit="A"
+                warn={geoStatus.motor_current_a > 2.0} danger={geoStatus.motor_current_a > 3.0} />
+              <TlmValue label="Timeouts" value={geoStatus.timeout_count ?? "--"} />
+              {geoStatus.pod_state && (
+                <TlmValue label="Pods" value={geoStatus.pod_state.map(s =>
+                    ({CARRIED: "·", PLACING: "▶", PLACED_OK: "OK", MARGINAL: "MARG", RETRIEVING: "◀"}[s] ?? s)
+                  ).join(" / ")}
+                  warn={geoStatus.marginal_mask > 0} />
+              )}
+              {geoStatus.pod_state && (
+                <TlmValue label="Seat N / reseats" value={
+                  geoStatus.pod_seat_force_n.map((f, i) =>
+                    `${f.toFixed(0)}(${geoStatus.pod_reseats[i]})`).join(" ")
+                } />
+              )}
+              <div style={{ marginTop: 8, textAlign: "center" }}>
+                <svg viewBox="0 0 160 36" style={{ width: "100%", maxWidth: 200, height: 36 }}>
+                  <rect x="10" y="12" width="40" height="12" rx="2" fill="#21262d" stroke="#30363d" />
+                  <text x="30" y="21" textAnchor="middle" fontSize="7" fill="#6e7681" fontFamily="monospace">BODY</text>
+                  {(() => {
+                    const st = geoStatus.mech_state ?? geoHk.mech_state;
+                    const armLen = st === "DEPLOYED" ? 90 : st === "STOWED" ? 10 : st === "DEPLOYING" ? 55 : st === "STOWING" ? 40 : 10;
+                    return (
+                      <g>
+                        <rect x="50" y="15" width={armLen} height="6" rx="1"
+                          fill={st === "DEPLOYED" ? "#f59e0b33" : "#161b22"}
+                          stroke={st === "FAULT" ? "#ef4444" : "#f59e0b"} strokeWidth={1} />
+                        <circle cx={50 + armLen} cy={18} r={4}
+                          fill={st === "DEPLOYED" ? "#f59e0b" : "#30363d"}
+                          stroke={st === "DEPLOYED" ? "#f59e0b" : "#484f58"} strokeWidth={1} />
+                      </g>
+                    );
+                  })()}
+                </svg>
+              </div>
+            </Panel>
+
+            <Panel title="Seismic + EM Source" icon="〰" accent="#10b981">
+              <TlmValue label="Acquiring" value={
+                (seisStatus.acquiring ?? seisHk.acquiring) != null
+                  ? ((seisStatus.acquiring ?? seisHk.acquiring) ? "YES" : "NO") : "--"
+              } />
+              <TlmValue label="Sample Rate" value={seisStatus.sample_rate_hz ?? "--"} unit="Hz" />
+              <TlmValue label="Samples" value={seisStatus.samples_collected != null ? seisStatus.samples_collected.toLocaleString() : "--"} />
+              <TlmValue label="Src Mode" value={seisStatus.source_mode ?? "--"} />
+              <TlmValue label="Src State" value={seisStatus.thumper_state ?? "--"}
+                warn={seisStatus.thumper_state === "CHARGING" || seisStatus.thumper_state === "SWEEPING"} />
+              <TlmValue label="Bank" value={
+                seisStatus.bank_v != null
+                  ? `${seisStatus.bank_v}V / ${seisStatus.bank_soc_pct}%` : "--"
+              } />
+              <TlmValue label="Force" value={seisStatus.thumper_force_n ?? "--"} unit="N" />
+              {seisStatus.source_mode === "SWEEP" && (
+                <TlmValue label="Sweep/Corr" value={
+                  seisStatus.sweep_progress_pct != null
+                    ? `${seisStatus.sweep_progress_pct}% / ${seisStatus.corr_progress_pct}%` : "--"
+                } warn={seisStatus.corr_progress_pct < 100} />
+              )}
+              {seisStatus.plate_baseline > 0 && (
+                <TlmValue label="Plate ratio" value={
+                  `${seisStatus.plate_ratio} / ${seisStatus.plate_baseline}` +
+                  (seisStatus.plate_degraded ? " DEGRADED" : "")
+                } warn={!seisStatus.plate_ok} danger={seisStatus.plate_degraded} />
+              )}
+              {seisStatus.pod_scores_valid && (
+                <TlmValue label="Pod scores" value={seisStatus.pod_scores.map(s => s.toFixed(2)).join(" / ")}
+                  warn={seisStatus.pod_score_ok_mask !== 0xF} />
+              )}
+              {seisStatus.pod_scores_valid && seisStatus.sync_residual_ms && (
+                <TlmValue label="Sync resid" value={seisStatus.sync_residual_ms.map(r => r.toFixed(2)).join(" / ") + " ms"}
+                  danger={seisStatus.sync_suspect_mask > 0} />
+              )}
+              <TlmValue label="Ice Flag" value={seisStatus.eval_flag != null ? (seisStatus.eval_flag ? "YES" : "NO") : "--"}
+                warn={seisStatus.eval_flag} />
+              <TlmValue label="Confidence" value={seisStatus.eval_confidence != null ? `${(seisStatus.eval_confidence * 100).toFixed(0)}%` : "--"}
+                warn={seisStatus.eval_confidence > 0.5} />
+              <TlmValue label="QC Clip" value={seisStatus.qc_clip != null ? (seisStatus.qc_clip ? "YES" : "OK") : "--"} danger={seisStatus.qc_clip} />
+              <div style={{ marginTop: 8 }}>
+                <div style={{ fontSize: 9, color: "#6e7681", marginBottom: 4, fontWeight: 600, letterSpacing: 1 }}>QUICKLOOK RMS</div>
+                <SeisChannelBars channels={seisQl.channels} />
+              </div>
+            </Panel>
+
+            <Panel title="Drill / Ice Prospector" icon="⛏" accent="#06b6d4">
+              <TlmValue label="State" value={drillHk.state ?? "--"}
+                warn={drillHk.state === "FAULT"} danger={drillHk.state === "FAULT"} />
+              <TlmValue label="Arm Angle" value={drillHk.arm_angle ?? drillStatus.arm_angle ?? "--"} unit="°" />
+              <TlmValue label="Arm Current" value={drillStatus.arm_current ?? "--"} unit="A"
+                warn={drillStatus.arm_current > 3.0} danger={drillStatus.arm_current > 5.0} />
+              <TlmValue label="Drill Depth" value={drillHk.drill_depth ?? drillStatus.drill_depth ?? "--"} unit="m" />
+              <TlmValue label="Drill RPM" value={drillStatus.drill_rpm ?? "--"} />
+              <TlmValue label="Torque" value={drillStatus.drill_torque ?? "--"} unit="Nm"
+                warn={drillStatus.drill_torque > 2.0} danger={drillStatus.drill_torque > 3.0} />
+              <TlmValue label="Cell Temp" value={drillStatus.cell_temp ?? "--"} unit="°C"
+                warn={drillStatus.cell_temp > 280} danger={drillStatus.cell_temp > 340} />
+              <TlmValue label="Vapor Press" value={drillStatus.vapor_pressure ?? "--"} unit="Pa" />
+              <TlmValue label="Volatile Conc" value={drillStatus.volatile_conc ?? "--"} unit="ppm" />
+              <TlmValue label="Sample State" value={drillStatus.sample_state ?? "--"} />
+              <TlmValue label="Sample Quality" value={
+                drillStatus.sample_quality === 1 ? "GOOD" :
+                drillStatus.sample_quality === 2 ? "MARGINAL" :
+                drillStatus.sample_quality === 3 ? "BAD" :
+                drillStatus.sample_quality === 0 ? "--" : "--"
+              } warn={drillStatus.sample_quality === 2} danger={drillStatus.sample_quality === 3} />
+              {drillHk.faults && drillHk.faults[0] !== "NONE" && (
+                <div style={{ marginTop: 6, padding: "4px 8px", background: "#ef444411", borderRadius: 4, border: "1px solid #ef444433" }}>
+                  <div style={{ fontSize: 9, color: "#6e7681", marginBottom: 2, fontWeight: 600, letterSpacing: 1 }}>DRILL FAULTS</div>
+                  <div style={{ fontSize: 11, color: "#ef4444", fontWeight: 600 }}>
+                    {drillHk.faults?.join(" · ")}
+                  </div>
+                </div>
+              )}
+            </Panel>
+
+            <Panel title="State Machine" icon="⏣" accent="#8b5cf6" span={2}>
+              <StateMachineViz currentState={currentState} />
+              <div style={{ display: "flex", gap: 24, marginTop: 8 }}>
+                <TlmValue label="Loop" value={seqMode.loop_count ?? "--"} />
+                <TlmValue label="Waypoint" value={seq.waypoint_idx ?? "--"} />
+                <TlmValue label="Cmd Count" value={seq.cmd_cnt ?? "--"} />
+                <TlmValue label="Err Count" value={seq.err_cnt ?? "--"} warn={(seq.err_cnt ?? 0) > 0} />
+                <TlmValue label="Faults" value={seq.faults?.join(", ") ?? "--"} danger={seq.faults?.[0] !== "NONE" && seq.faults?.[0] != null} />
+              </div>
+            </Panel>
+
+            <Panel title="Health & FDIR" icon="♥" accent={hasFaults ? "#ef4444" : "#10b981"}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <MiniGauge label="BATTERY" value={hk.battery_v} min={20} max={26} unit="V" warnLow={23} dangerLow={22} />
+                <MiniGauge label="SOC" value={hk.battery_soc} min={0} max={100} unit="%" warnLow={20} dangerLow={10} />
+                <MiniGauge label="BOARD TEMP" value={hk.board_temp_c} min={0} max={70} unit="°C" warnHigh={45} dangerHigh={55} />
+                <MiniGauge label="MOTOR TEMP" value={hk.motor_temp_c} min={0} max={80} unit="°C" warnHigh={50} dangerHigh={65} />
+                <MiniGauge label="TILT" value={hk.tilt_deg} min={0} max={45} unit="°" warnHigh={20} dangerHigh={30} />
+                <MiniGauge label="CPU" value={hk.cpu_load_pct} min={0} max={100} unit="%" warnHigh={70} dangerHigh={90} />
+              </div>
+              <div style={{ marginTop: 10, padding: "6px 8px", background: hasFaults ? "#ef444411" : "#161b22", borderRadius: 4, border: `1px solid ${hasFaults ? "#ef444433" : "#21262d"}` }}>
+                <div style={{ fontSize: 9, color: "#6e7681", marginBottom: 3, fontWeight: 600, letterSpacing: 1 }}>FAULTS</div>
+                <div style={{ fontSize: 11, color: hasFaults ? "#ef4444" : "#3fb950", fontWeight: 600 }}>
+                  {hk.faults?.join(" · ") ?? "—"}
+                </div>
+              </div>
+              <div style={{ marginTop: 6, display: "flex", gap: 12 }}>
+                <TlmValue label="Watchdog" value={hk.watchdog_ok != null ? (hk.watchdog_ok ? "OK" : "FAIL") : "--"} danger={hk.watchdog_ok === false} />
+                <TlmValue label="Safe Trig" value={hk.safe_trigger != null ? (hk.safe_trigger ? "YES" : "NO") : "--"} danger={hk.safe_trigger} />
+              </div>
+            </Panel>
+          </div>
+
+          <footer style={{
+            padding: "8px 24px", borderTop: "1px solid #1e2733",
+            display: "flex", justifyContent: "space-between",
+            fontSize: 9, color: "#30363d", fontFamily: "'JetBrains Mono', monospace",
+          }}>
+            <span>WOK Ground Control v2.0 · cFS Draco v7.0.0 · WebSocket Bridge · 6 Apps</span>
+            <span>{WS_URL} · CI_LAB :1234 · TO_LAB :2234</span>
+          </footer>
+        </div>
+      );
+    }
+
+    // ─── MOUNT ─────────────────────────────────────────────────────────────
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<WokGroundControl />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,55 @@
+Patch to the NASA cFS CI_LAB/TO_LAB apps (Apache-2.0): make the UDP
+command/telemetry ports honour an AEGIS_PORT_OFFSET environment
+variable so several cFS instances coexist on one host. The patched
+sources remain under the Apache License 2.0.
+
+diff --git a/apps/ci_lab/fsw/src/ci_lab_app.c b/apps/ci_lab/fsw/src/ci_lab_app.c
+index a7ddc78..8e3324f 100644
+--- a/apps/ci_lab/fsw/src/ci_lab_app.c
++++ b/apps/ci_lab/fsw/src/ci_lab_app.c
+@@ -25,6 +25,8 @@
+ **   Include Files:
+ */
+ 
++#include <stdlib.h>
++
+ #include "ci_lab_app.h"
+ #include "ci_lab_perfids.h"
+ #include "ci_lab_msgids.h"
+@@ -156,6 +158,11 @@ void CI_LAB_TaskInit(void)
+     {
+         OS_SocketAddrInit(&CI_LAB_Global.SocketAddress, OS_SocketDomain_INET);
+         DefaultListenPort = CI_LAB_MISSION_BASE_UDP_PORT + CFE_PSP_GetProcessorId() - 1;
++        /* AEGIS_PORT_OFFSET shifts the UDP port for multi-instance hosts */
++        {
++            const char *offset_env = getenv("AEGIS_PORT_OFFSET");
++            if (offset_env) DefaultListenPort += atoi(offset_env);
++        }
+         OS_SocketAddrSetPort(&CI_LAB_Global.SocketAddress, DefaultListenPort);
+ 
+         status = OS_SocketBind(CI_LAB_Global.SocketID, &CI_LAB_Global.SocketAddress);
+diff --git a/apps/to_lab/fsw/src/to_lab_app.c b/apps/to_lab/fsw/src/to_lab_app.c
+index df9a3c7..7ae8555 100644
+--- a/apps/to_lab/fsw/src/to_lab_app.c
++++ b/apps/to_lab/fsw/src/to_lab_app.c
+@@ -21,6 +21,8 @@
+  *  This file contains the source code for the TO lab application
+  */
+ 
++#include <stdlib.h>
++
+ #include "cfe.h"
+ #include "cfe_config.h"
+ 
+@@ -292,6 +294,11 @@ void TO_LAB_forward_telemetry(void)
+     size_t           NetBufSize;
+     uint32           PktCount = 0;
+     uint16           PortNum = TO_LAB_MISSION_TLM_PORT + CFE_PSP_GetProcessorId() - 1;
++    /* AEGIS_PORT_OFFSET shifts the UDP port for multi-instance hosts */
++    {
++        const char *offset_env = getenv("AEGIS_PORT_OFFSET");
++        if (offset_env) PortNum += atoi(offset_env);
++    }
+ 
+     OS_SocketAddrInit(&d_addr, OS_SocketDomain_INET);
+     OS_SocketAddrSetPort(&d_addr, PortNum);

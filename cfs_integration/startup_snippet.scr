@@ -1,0 +1,9 @@
+! Add these lines BEFORE the first '!' in your cpu1_cfe_es_startup.scr
+! The '!' character marks end-of-file — cFS ignores everything after it.
+
+CFE_APP, wok_sequencer, WOK_Seq_AppMain,   WOK_SEQ,   80, 16384, 0x0, 0;
+CFE_APP, wok_seis,      WOK_Seis_AppMain,  WOK_SEIS,  85, 16384, 0x0, 0;
+CFE_APP, wok_nav,       WOK_Nav_AppMain,   WOK_NAV,   90, 16384, 0x0, 0;
+CFE_APP, wok_geo,       WOK_Geo_AppMain,   WOK_GEO,   90, 16384, 0x0, 0;
+CFE_APP, wok_drill,     WOK_Drill_AppMain, WOK_DRILL, 90, 16384, 0x0, 0;
+CFE_APP, wok_hk_health, WOK_Hk_AppMain,    WOK_HK,    95, 16384, 0x0, 0;

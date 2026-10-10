@@ -1,0 +1,23 @@
+WOK cFS Flight Software
+Copyright 2026 Aegis Station Infrastructure LLC
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may
+not use this software except in compliance with the License. You may
+obtain a copy of the License in the LICENSE file or at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This software is designed to be built against NASA's core Flight System
+(cFS), https://github.com/nasa/cFS, which is licensed under the Apache
+License, Version 2.0, and is not included in this repository.
+
+The following files are derived from or modify NASA cFS components and
+carry NASA's original Apache License, Version 2.0 notice:
+
+    cfs_integration/to_lab_sub.c      derived from the cFS TO_LAB
+                                      subscription table
+    cfs_integration/port-offset.patch modifies cFS CI_LAB and TO_LAB
+                                      sources when applied
+
+NASA cFS is Copyright (c) 2020 United States Government as represented
+by the Administrator of the National Aeronautics and Space Administration.
